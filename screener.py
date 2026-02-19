@@ -29,13 +29,14 @@ from config import (
     STOP_LOSS_BELOW_LOW_PCT,
 )
 from data_sources import (
+    batch_fetch_avg_daily_volume,
+    batch_fetch_price_data,
     classify_catalyst,
+    compute_rel_vol,
     get_alpaca_quote,
     get_gappers,
     get_news_headlines,
-    get_relative_volume,
     get_spy_status,
-    get_stock_data,
 )
 
 log = logging.getLogger(__name__)
@@ -136,17 +137,21 @@ def run_screen(
         log.warning("No gapper candidates returned from Finviz")
         return [], spy_pct, spy_price
 
-    # ── Step 3: Per-ticker validation ────────────────────────────────────────
+    # ── Step 3: Batch fetch price data (2 API calls for ALL tickers) ─────────
+    # This is the key change vs. the old approach which made 2 calls *per ticker*.
+    batch_prices = batch_fetch_price_data(raw_tickers)
+    batch_avg_vols = batch_fetch_avg_daily_volume(raw_tickers)
+
+    # ── Step 4: Per-ticker filtering (no yfinance calls inside this loop) ────
     candidates: List[CandidateStock] = []
 
     for ticker in raw_tickers:
         log.info("Evaluating %s …", ticker)
-        time.sleep(REQUEST_DELAY)   # pace requests to avoid yfinance rate limits
 
-        # 3a. Price / gap data
-        stock = get_stock_data(ticker)
+        # 4a. Price / gap data — from pre-fetched batch, no API call
+        stock = batch_prices.get(ticker)
         if stock is None:
-            log.debug("%s: skipped — no price data", ticker)
+            log.debug("%s: skipped — no price data in batch", ticker)
             continue
 
         if stock["gap_pct"] < min_gap_pct:
@@ -158,23 +163,23 @@ def run_screen(
             )
             continue
 
-        # 3b. News catalyst
+        # 4b. Relative volume — computed from pre-fetched avg, no API call
+        avg_daily_vol = batch_avg_vols.get(ticker, 0.0)
+        rel_vol = compute_rel_vol(stock["volume_today"], avg_daily_vol)
+        if rel_vol < min_rel_vol:
+            log.debug(
+                "%s: skipped — rel_vol %.2f < threshold %.2f",
+                ticker, rel_vol, min_rel_vol,
+            )
+            continue
+
+        # 4c. News catalyst — one API call per ticker; pace with sleep
+        time.sleep(REQUEST_DELAY)
         headlines = get_news_headlines(ticker)
         catalyst_type, catalyst_summary = classify_catalyst(headlines)
 
         if catalyst_type == "unknown" and not headlines:
             log.debug("%s: skipped — no news catalyst found", ticker)
-            continue
-
-        # 3c. Relative volume
-        rel_vol = get_relative_volume(ticker, volume_today=stock["volume_today"])
-        if rel_vol < min_rel_vol:
-            log.debug(
-                "%s: skipped — rel_vol %.2f < threshold %.2f",
-                ticker,
-                rel_vol,
-                min_rel_vol,
-            )
             continue
 
         log.info(
@@ -185,7 +190,7 @@ def run_screen(
             catalyst_type,
         )
 
-        # 3d. Refine entry price with Alpaca real-time quote if available
+        # 4d. Optionally refine entry price with Alpaca real-time quote
         current_price = stock["current_price"]
         alpaca_quote = get_alpaca_quote(ticker)
         if alpaca_quote and alpaca_quote["last"] > 0:

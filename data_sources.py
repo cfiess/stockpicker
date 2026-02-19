@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -31,8 +31,6 @@ from config import (
     MAX_CANDIDATES,
     MIN_GAP_PCT,
     RELVOL_LOOKBACK_DAYS,
-    RELVOL_SNAPSHOT_HOUR,
-    RELVOL_SNAPSHOT_MINUTE,
     SPY_TICKER,
     YFINANCE_BACKOFF_BASE,
     YFINANCE_RETRIES,
@@ -158,7 +156,7 @@ def get_spy_status() -> Tuple[float, float]:
     """
     try:
         spy = yf.Ticker(SPY_TICKER)
-        hist = spy.history(period="2d", interval="1m")
+        hist = _yf_with_retry(spy.history, period="2d", interval="1m")
         if hist.empty:
             log.warning("SPY: empty history returned")
             return 0.0, 0.0
@@ -184,135 +182,183 @@ def get_spy_status() -> Tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Per-stock data
+# Batch price data (replaces per-ticker get_stock_data calls)
 # ---------------------------------------------------------------------------
 
-def get_stock_data(ticker: str) -> Optional[Dict]:
+def _extract_ticker_df(raw, ticker: str, n_tickers: int):
     """
-    Fetch intraday price data for *ticker* and compute gap metrics.
+    Safely extract a single-ticker sub-DataFrame from a yf.download() result.
 
-    Uses a single yfinance call (5d, 1m) to cover both prev-close and
-    today's intraday bars — avoids making two separate requests.
-
-    Returns a dict with keys:
-        ticker, open, prev_close, high, low, current_price,
-        gap_pct, gap_held (bool), float_shares, volume_today
-
-    Returns None if data is unavailable.
+    yfinance returns a flat DataFrame for 1 ticker, and a MultiIndex DataFrame
+    for multiple tickers where the top level is the ticker symbol.
     """
+    if n_tickers == 1:
+        return raw
     try:
-        tk = yf.Ticker(ticker)
-
-        # One call: 5 trading days of 1m bars covers prev close + today
-        hist_1m = _yf_with_retry(tk.history, period="5d", interval="1m", prepost=False)
-        if hist_1m.empty:
-            log.debug("%s: empty 1m history", ticker)
-            return None
-
-        today_et = datetime.now(ET).date()
-        today_bars = hist_1m[hist_1m.index.date == today_et]
-        prev_bars = hist_1m[hist_1m.index.date < today_et]
-
-        if today_bars.empty or prev_bars.empty:
-            log.debug("%s: missing today or previous bars", ticker)
-            return None
-
-        prev_close = float(prev_bars["Close"].iloc[-1])
-        today_open = float(today_bars["Open"].iloc[0])   # first 1m bar open
-        current_price = float(today_bars["Close"].iloc[-1])
-        high_of_day = float(today_bars["High"].max())
-        low_of_day = float(today_bars["Low"].min())
-        volume_today = int(today_bars["Volume"].sum())
-
-        gap_pct = (today_open - prev_close) / prev_close if prev_close > 0 else 0.0
-
-        # "Gap held" = price hasn't filled more than half the gap
-        gap_dollars = today_open - prev_close
-        gap_held = (current_price > prev_close) and (
-            current_price >= prev_close + gap_dollars * 0.5
-        )
-
-        # Float shares — fast_info is a lightweight property, not an extra HTTP call
-        try:
-            info = tk.fast_info
-            float_shares = int(getattr(info, "shares_outstanding", 0) or 0)
-        except Exception:
-            float_shares = 0
-
-        return {
-            "ticker": ticker,
-            "open": today_open,
-            "prev_close": prev_close,
-            "high": high_of_day,
-            "low": low_of_day,
-            "current_price": current_price,
-            "gap_pct": gap_pct,
-            "gap_held": gap_held,
-            "float_shares": float_shares,
-            "volume_today": volume_today,
-        }
-
-    except Exception as exc:  # noqa: BLE001
-        log.error("%s: data fetch error — %s", ticker, exc)
+        sub = raw[ticker]
+        # Drop rows where all OHLCV columns are NaN (some tickers have sparse data)
+        return sub.dropna(how="all")
+    except KeyError:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Relative volume
-# ---------------------------------------------------------------------------
-
-def get_relative_volume(
-    ticker: str,
-    volume_today: int,
-    lookback_days: int = RELVOL_LOOKBACK_DAYS,
-) -> float:
+def batch_fetch_price_data(tickers: List[str]) -> Dict[str, Dict]:
     """
-    Return the relative volume ratio using daily bars — no extra 1m fetch.
+    Download 5-day 1-minute bars for ALL tickers in a single API call.
 
-    Method:
-      1. Pull lookback_days of daily bars (one lightweight API call).
-      2. Compute average full-day volume over that window.
-      3. Scale by the fraction of the trading session elapsed so far.
-         e.g. at 9:45 ET = 15 min into a 390-min day → expect ~3.8% of daily vol.
-      4. rel_vol = volume_today / expected_volume_by_now
-
-    A value ≥ 2.0 means the stock is running at twice its typical pace.
+    Returns a dict mapping ticker → stock_data_dict with the same keys as
+    the old get_stock_data() so the rest of the pipeline is unchanged.
     """
+    if not tickers:
+        return {}
+
+    unique = list(dict.fromkeys(tickers))  # preserve order, remove dupes
+    log.info("Batch downloading 1m intraday data for %d tickers…", len(unique))
+
     try:
-        now_et = datetime.now(ET)
-        minutes_since_open = max(
-            (now_et.hour - 9) * 60 + now_et.minute - 30, 1
+        raw = yf.download(
+            tickers=unique,
+            period="5d",
+            interval="1m",
+            group_by="ticker",
+            progress=False,
+            auto_adjust=True,
+            prepost=False,
         )
-        session_fraction = minutes_since_open / 390.0  # 390 = full trading day
-
-        tk = yf.Ticker(ticker)
-        hist_daily = _yf_with_retry(
-            tk.history, period=f"{lookback_days + 5}d", interval="1d"
-        )
-        if hist_daily.empty:
-            return 0.0
-
-        today_et = now_et.date()
-        past_daily = hist_daily[hist_daily.index.date < today_et]
-        if past_daily.empty:
-            return 0.0
-
-        avg_daily_vol = float(past_daily["Volume"].tail(lookback_days).mean())
-        if avg_daily_vol == 0:
-            return 0.0
-
-        expected_vol_by_now = avg_daily_vol * session_fraction
-        rel_vol = volume_today / expected_vol_by_now
-
-        log.debug(
-            "%s: rel_vol=%.2f  today_vol=%d  expected=%d  (%.0f min into session)",
-            ticker, rel_vol, volume_today, int(expected_vol_by_now), minutes_since_open,
-        )
-        return rel_vol
-
     except Exception as exc:  # noqa: BLE001
-        log.error("%s: rel_vol error — %s", ticker, exc)
+        log.error("Batch 1m download failed: %s", exc)
+        return {}
+
+    today_et = datetime.now(ET).date()
+    result: Dict[str, Dict] = {}
+
+    for ticker in unique:
+        try:
+            hist = _extract_ticker_df(raw, ticker, len(unique))
+            if hist is None or hist.empty:
+                log.debug("%s: no data in batch result", ticker)
+                continue
+
+            today_bars = hist[hist.index.date == today_et]
+            prev_bars = hist[hist.index.date < today_et]
+
+            if today_bars.empty or prev_bars.empty:
+                log.debug("%s: missing today or prev bars", ticker)
+                continue
+
+            prev_close = float(prev_bars["Close"].iloc[-1])
+            today_open = float(today_bars["Open"].iloc[0])
+            current_price = float(today_bars["Close"].iloc[-1])
+            high_of_day = float(today_bars["High"].max())
+            low_of_day = float(today_bars["Low"].min())
+            volume_today = int(today_bars["Volume"].sum())
+
+            gap_pct = (today_open - prev_close) / prev_close if prev_close > 0 else 0.0
+            gap_dollars = today_open - prev_close
+            gap_held = (current_price > prev_close) and (
+                current_price >= prev_close + gap_dollars * 0.5
+            )
+
+            result[ticker] = {
+                "ticker": ticker,
+                "open": today_open,
+                "prev_close": prev_close,
+                "high": high_of_day,
+                "low": low_of_day,
+                "current_price": current_price,
+                "gap_pct": gap_pct,
+                "gap_held": gap_held,
+                "float_shares": 0,  # fetched separately via fast_info if needed
+                "volume_today": volume_today,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: batch parse error — %s", ticker, exc)
+
+    log.info(
+        "Batch 1m download complete: %d/%d tickers with data",
+        len(result), len(unique),
+    )
+    return result
+
+
+def batch_fetch_avg_daily_volume(
+    tickers: List[str],
+    lookback_days: int = RELVOL_LOOKBACK_DAYS,
+) -> Dict[str, float]:
+    """
+    Download 30-day daily bars for ALL tickers in a single API call.
+
+    Returns a dict mapping ticker → average full-day volume over *lookback_days*.
+    Used by compute_rel_vol() below.
+    """
+    if not tickers:
+        return {}
+
+    unique = list(dict.fromkeys(tickers))
+    log.info("Batch downloading daily volume data for %d tickers…", len(unique))
+
+    try:
+        raw = yf.download(
+            tickers=unique,
+            period="30d",
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            auto_adjust=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error("Batch daily download failed: %s", exc)
+        return {}
+
+    today_et = datetime.now(ET).date()
+    result: Dict[str, float] = {}
+
+    for ticker in unique:
+        try:
+            hist = _extract_ticker_df(raw, ticker, len(unique))
+            if hist is None or hist.empty:
+                continue
+
+            past = hist[hist.index.date < today_et]
+            if past.empty:
+                continue
+
+            avg_vol = float(past["Volume"].tail(lookback_days).mean())
+            result[ticker] = avg_vol
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s: daily batch parse error — %s", ticker, exc)
+
+    log.info(
+        "Batch daily download complete: %d/%d tickers with volume",
+        len(result), len(unique),
+    )
+    return result
+
+
+def compute_rel_vol(volume_today: int, avg_daily_vol: float) -> float:
+    """
+    Compute relative volume from pre-fetched average daily volume.
+
+    Scales avg_daily_vol by the fraction of the trading session elapsed
+    to estimate expected volume at the current time.
+    """
+    if avg_daily_vol <= 0:
         return 0.0
+
+    now_et = datetime.now(ET)
+    minutes_since_open = max((now_et.hour - 9) * 60 + now_et.minute - 30, 1)
+    session_fraction = minutes_since_open / 390.0  # 390 min = full session
+
+    expected = avg_daily_vol * session_fraction
+    if expected <= 0:
+        return 0.0
+
+    rel_vol = volume_today / expected
+    log.debug(
+        "rel_vol=%.2f  today=%d  expected=%d  (%d min into session)",
+        rel_vol, volume_today, int(expected), minutes_since_open,
+    )
+    return rel_vol
 
 
 # ---------------------------------------------------------------------------
