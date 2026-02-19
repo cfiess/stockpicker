@@ -1,0 +1,18 @@
+# Stock Screener — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Market data ─────────────────────────────────────────────────────────────
+yfinance>=0.2.38            # Yahoo Finance OHLCV, news, ticker info
+requests>=2.31.0            # HTTP client (Finviz scraping, Alpaca API)
+beautifulsoup4>=4.12.3      # HTML parsing for Finviz screener table
+lxml>=5.1.0                 # Fast HTML parser (used by BeautifulSoup)
+
+# ── SMS delivery ─────────────────────────────────────────────────────────────
+twilio>=9.0.0               # Twilio REST client for SMS
+
+# ── Environment / config ─────────────────────────────────────────────────────
+python-dotenv>=1.0.0        # Load .env file into os.environ
+
+# ── Standard library backports / typing ──────────────────────────────────────
+# zoneinfo is built-in for Python 3.9+; backport needed for 3.8
+tzdata>=2024.1              # IANA timezone database (required on some platforms)
