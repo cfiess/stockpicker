@@ -36,6 +36,13 @@ RELVOL_SNAPSHOT_MINUTE: int = 45
 # Days of historical volume used to compute "average" volume at 9:45
 RELVOL_LOOKBACK_DAYS: int = 20
 
+# Seconds to sleep between per-ticker yfinance requests (avoids rate limits)
+REQUEST_DELAY: float = 1.5
+
+# Max retries on yfinance rate-limit errors, with exponential backoff
+YFINANCE_RETRIES: int = 4
+YFINANCE_BACKOFF_BASE: float = 3.0  # seconds; doubles each retry
+
 # ---------------------------------------------------------------------------
 # Catalyst keywords used to classify news headlines
 # ---------------------------------------------------------------------------

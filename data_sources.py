@@ -34,6 +34,8 @@ from config import (
     RELVOL_SNAPSHOT_HOUR,
     RELVOL_SNAPSHOT_MINUTE,
     SPY_TICKER,
+    YFINANCE_BACKOFF_BASE,
+    YFINANCE_RETRIES,
 )
 
 log = logging.getLogger(__name__)
@@ -63,6 +65,38 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(str(value).replace(",", "").replace("%", ""))
     except (TypeError, ValueError):
         return default
+
+
+def _yf_with_retry(fn, *args, **kwargs):
+    """
+    Call a yfinance function with exponential backoff on rate-limit errors.
+
+    Retries up to YFINANCE_RETRIES times.  Waits YFINANCE_BACKOFF_BASE,
+    then 2×, 4×, 8× that value between attempts.
+    """
+    last_exc: Exception = RuntimeError("unknown yfinance error")
+    for attempt in range(YFINANCE_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            msg = str(exc).lower()
+            is_rate_limit = any(
+                phrase in msg
+                for phrase in ("too many requests", "rate limit", "rate limited", "429")
+            )
+            if is_rate_limit and attempt < YFINANCE_RETRIES - 1:
+                delay = YFINANCE_BACKOFF_BASE * (2 ** attempt)
+                log.warning(
+                    "yfinance rate limited — waiting %.0fs (attempt %d/%d)",
+                    delay,
+                    attempt + 1,
+                    YFINANCE_RETRIES,
+                )
+                time.sleep(delay)
+            else:
+                raise
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -157,49 +191,51 @@ def get_stock_data(ticker: str) -> Optional[Dict]:
     """
     Fetch intraday price data for *ticker* and compute gap metrics.
 
+    Uses a single yfinance call (5d, 1m) to cover both prev-close and
+    today's intraday bars — avoids making two separate requests.
+
     Returns a dict with keys:
         ticker, open, prev_close, high, low, current_price,
-        gap_pct, gap_held (bool), float_shares, volume_today,
-        avg_volume_at_snapshot (float)
+        gap_pct, gap_held (bool), float_shares, volume_today
 
     Returns None if data is unavailable.
     """
     try:
         tk = yf.Ticker(ticker)
-        info = tk.fast_info  # lightweight version — avoids heavy scraping
 
-        # Historical data for previous close
-        hist_daily = tk.history(period="2d", interval="1d")
-        if len(hist_daily) < 2:
-            log.debug("%s: insufficient daily history", ticker)
+        # One call: 5 trading days of 1m bars covers prev close + today
+        hist_1m = _yf_with_retry(tk.history, period="5d", interval="1m", prepost=False)
+        if hist_1m.empty:
+            log.debug("%s: empty 1m history", ticker)
             return None
 
-        prev_close = float(hist_daily["Close"].iloc[-2])
-        today_open = float(hist_daily["Open"].iloc[-1])
+        today_et = datetime.now(ET).date()
+        today_bars = hist_1m[hist_1m.index.date == today_et]
+        prev_bars = hist_1m[hist_1m.index.date < today_et]
 
-        # Intraday 1-minute bars for today
-        today_1m = tk.history(period="1d", interval="1m")
-        if today_1m.empty:
+        if today_bars.empty or prev_bars.empty:
+            log.debug("%s: missing today or previous bars", ticker)
             return None
 
-        current_price = float(today_1m["Close"].iloc[-1])
-        high_of_day = float(today_1m["High"].max())
-        low_of_day = float(today_1m["Low"].min())
-        volume_today = int(today_1m["Volume"].sum())
+        prev_close = float(prev_bars["Close"].iloc[-1])
+        today_open = float(today_bars["Open"].iloc[0])   # first 1m bar open
+        current_price = float(today_bars["Close"].iloc[-1])
+        high_of_day = float(today_bars["High"].max())
+        low_of_day = float(today_bars["Low"].min())
+        volume_today = int(today_bars["Volume"].sum())
 
         gap_pct = (today_open - prev_close) / prev_close if prev_close > 0 else 0.0
 
-        # "Gap held" = current price is still above the previous close
-        # and hasn't filled more than half the gap
+        # "Gap held" = price hasn't filled more than half the gap
         gap_dollars = today_open - prev_close
         gap_held = (current_price > prev_close) and (
             current_price >= prev_close + gap_dollars * 0.5
         )
 
-        # Float shares (may be None for some tickers)
+        # Float shares — fast_info is a lightweight property, not an extra HTTP call
         try:
-            float_shares = getattr(info, "shares_outstanding", None) or 0
-            float_shares = int(float_shares)
+            info = tk.fast_info
+            float_shares = int(getattr(info, "shares_outstanding", 0) or 0)
         except Exception:
             float_shares = 0
 
@@ -231,60 +267,47 @@ def get_relative_volume(
     lookback_days: int = RELVOL_LOOKBACK_DAYS,
 ) -> float:
     """
-    Return the relative volume ratio:
-        today's volume (since open) / avg volume at same elapsed time
-        over the past *lookback_days* trading days.
+    Return the relative volume ratio using daily bars — no extra 1m fetch.
 
-    A value of 2.0 means 2× average volume — our minimum threshold.
+    Method:
+      1. Pull lookback_days of daily bars (one lightweight API call).
+      2. Compute average full-day volume over that window.
+      3. Scale by the fraction of the trading session elapsed so far.
+         e.g. at 9:45 ET = 15 min into a 390-min day → expect ~3.8% of daily vol.
+      4. rel_vol = volume_today / expected_volume_by_now
+
+    A value ≥ 2.0 means the stock is running at twice its typical pace.
     """
     try:
         now_et = datetime.now(ET)
-        snapshot_minutes_since_open = (
-            (RELVOL_SNAPSHOT_HOUR - 9) * 60
-            + RELVOL_SNAPSHOT_MINUTE
-            - 30  # market opens at 9:30
+        minutes_since_open = max(
+            (now_et.hour - 9) * 60 + now_et.minute - 30, 1
         )
+        session_fraction = minutes_since_open / 390.0  # 390 = full trading day
 
-        # Fetch enough historical daily data
         tk = yf.Ticker(ticker)
-        hist_1m = tk.history(
-            period=f"{lookback_days + 5}d",
-            interval="1m",
-            prepost=False,
+        hist_daily = _yf_with_retry(
+            tk.history, period=f"{lookback_days + 5}d", interval="1d"
         )
-        if hist_1m.empty:
+        if hist_daily.empty:
             return 0.0
 
-        today_date = now_et.date()
-        past_volumes: List[float] = []
+        today_et = now_et.date()
+        past_daily = hist_daily[hist_daily.index.date < today_et]
+        if past_daily.empty:
+            return 0.0
 
-        # For each past trading day, sum volume from open to snapshot time
-        trading_days = sorted(
-            {d for d in hist_1m.index.date if d < today_date},
-            reverse=True,
+        avg_daily_vol = float(past_daily["Volume"].tail(lookback_days).mean())
+        if avg_daily_vol == 0:
+            return 0.0
+
+        expected_vol_by_now = avg_daily_vol * session_fraction
+        rel_vol = volume_today / expected_vol_by_now
+
+        log.debug(
+            "%s: rel_vol=%.2f  today_vol=%d  expected=%d  (%.0f min into session)",
+            ticker, rel_vol, volume_today, int(expected_vol_by_now), minutes_since_open,
         )
-
-        for day in trading_days[:lookback_days]:
-            day_bars = hist_1m[hist_1m.index.date == day]
-            if day_bars.empty:
-                continue
-
-            open_time = day_bars.index[0]
-            cutoff = open_time + timedelta(minutes=snapshot_minutes_since_open)
-            window_bars = day_bars[day_bars.index <= cutoff]
-
-            if not window_bars.empty:
-                past_volumes.append(float(window_bars["Volume"].sum()))
-
-        if not past_volumes:
-            return 0.0
-
-        avg_vol = sum(past_volumes) / len(past_volumes)
-        if avg_vol == 0:
-            return 0.0
-
-        rel_vol = volume_today / avg_vol
-        log.debug("%s: rel_vol=%.2f (today=%d, avg=%d)", ticker, rel_vol, volume_today, avg_vol)
         return rel_vol
 
     except Exception as exc:  # noqa: BLE001

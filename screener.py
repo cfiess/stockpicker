@@ -15,6 +15,7 @@ Pipeline stages
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from config import (
     MIN_GAP_PCT,
     MIN_REL_VOL,
     MIN_SPY_PCT,
+    REQUEST_DELAY,
     STOP_LOSS_BELOW_LOW_PCT,
 )
 from data_sources import (
@@ -139,6 +141,7 @@ def run_screen(
 
     for ticker in raw_tickers:
         log.info("Evaluating %s …", ticker)
+        time.sleep(REQUEST_DELAY)   # pace requests to avoid yfinance rate limits
 
         # 3a. Price / gap data
         stock = get_stock_data(ticker)
