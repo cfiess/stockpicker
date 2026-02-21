@@ -21,6 +21,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import re
+
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -97,44 +99,93 @@ def _yf_with_retry(fn, *args, **kwargs):
     raise last_exc
 
 
+def _yf_download_with_retry(tickers: List[str], **kwargs):
+    """
+    Wrapper around yf.download() that retries when the result is empty.
+
+    yf.download() does NOT raise an exception on rate-limit errors — it
+    silently swallows them and returns an empty DataFrame.  This wrapper
+    detects that case and retries with backoff.
+    """
+    import pandas as pd
+
+    for attempt in range(YFINANCE_RETRIES):
+        result = yf.download(tickers=tickers, progress=False, **kwargs)
+
+        # Success if at least one ticker has non-NaN data
+        if not result.empty and result.notna().any().any():
+            return result
+
+        if attempt < YFINANCE_RETRIES - 1:
+            delay = YFINANCE_BACKOFF_BASE * (2 ** attempt)
+            log.warning(
+                "yf.download returned no data (rate limited?) — "
+                "waiting %.0fs before retry %d/%d",
+                delay,
+                attempt + 1,
+                YFINANCE_RETRIES,
+            )
+            time.sleep(delay)
+        else:
+            log.error(
+                "yf.download failed after %d attempts — still no data", YFINANCE_RETRIES
+            )
+
+    return result  # return empty DataFrame as last resort
+
+
 # ---------------------------------------------------------------------------
 # Finviz gapper screener
 # ---------------------------------------------------------------------------
+
+_TICKER_RE = re.compile(r'^[A-Z]{1,6}$')
+
+
+def _is_valid_ticker(text: str) -> bool:
+    """Return True if *text* looks like a real stock ticker symbol."""
+    return bool(_TICKER_RE.match(text.strip()))
+
 
 def get_gappers(min_gap_pct: float = MIN_GAP_PCT) -> List[str]:
     """
     Return a list of ticker symbols that gapped up >= *min_gap_pct* today,
     pulled from the Finviz screener.  Falls back to an empty list on error.
+
+    Finviz ticker links reliably carry class="screener-link-primary".
+    We also fall back to href pattern matching in case the class changes.
+    A final sanity filter rejects anything that isn't 1-6 uppercase letters.
     """
-    url = FINVIZ_SCREENER_URL
     tickers: List[str] = []
 
     try:
-        resp = _SESSION.get(url, timeout=15)
+        resp = _SESSION.get(FINVIZ_SCREENER_URL, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Finviz results table rows contain ticker links
-        table = soup.find("table", {"id": "screener-views-table"})
-        if table is None:
-            # Try the newer Finviz layout
-            table = soup.find("table", class_="screener_table")
+        # Primary strategy: Finviz ticker links use class="screener-link-primary"
+        links = soup.find_all("a", class_="screener-link-primary")
 
-        if table is None:
-            log.warning("Finviz: could not locate results table — HTML layout may have changed")
-            return []
+        # Fallback: find by href pattern (?t=TICKER or quote.ashx?t=TICKER)
+        if not links:
+            log.debug("Finviz: screener-link-primary not found, trying href pattern")
+            links = soup.find_all(
+                "a", href=re.compile(r"quote\.ashx\?t=[A-Z]")
+            )
 
-        rows = table.find_all("tr")[1:]  # skip header row
-        for row in rows[:MAX_CANDIDATES]:
-            cells = row.find_all("td")
-            if not cells:
-                continue
-            ticker_cell = cells[1] if len(cells) > 1 else cells[0]
-            ticker = ticker_cell.get_text(strip=True)
-            if ticker:
+        for link in links:
+            ticker = link.get_text(strip=True)
+            if _is_valid_ticker(ticker) and ticker not in tickers:
                 tickers.append(ticker)
+            if len(tickers) >= MAX_CANDIDATES:
+                break
 
-        log.info("Finviz returned %d gapper candidates", len(tickers))
+        if not tickers:
+            log.warning(
+                "Finviz: zero valid tickers extracted — HTML layout may have changed. "
+                "Check https://finviz.com/screener.ashx manually."
+            )
+        else:
+            log.info("Finviz returned %d gapper candidates: %s", len(tickers), tickers)
 
     except requests.RequestException as exc:
         log.error("Finviz request failed: %s", exc)
@@ -216,12 +267,11 @@ def batch_fetch_price_data(tickers: List[str]) -> Dict[str, Dict]:
     log.info("Batch downloading 1m intraday data for %d tickers…", len(unique))
 
     try:
-        raw = yf.download(
-            tickers=unique,
+        raw = _yf_download_with_retry(
+            unique,
             period="5d",
             interval="1m",
             group_by="ticker",
-            progress=False,
             auto_adjust=True,
             prepost=False,
         )
@@ -298,12 +348,11 @@ def batch_fetch_avg_daily_volume(
     log.info("Batch downloading daily volume data for %d tickers…", len(unique))
 
     try:
-        raw = yf.download(
-            tickers=unique,
+        raw = _yf_download_with_retry(
+            unique,
             period="30d",
             interval="1d",
             group_by="ticker",
-            progress=False,
             auto_adjust=True,
         )
     except Exception as exc:  # noqa: BLE001

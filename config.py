@@ -41,7 +41,7 @@ REQUEST_DELAY: float = 1.5
 
 # Max retries on yfinance rate-limit errors, with exponential backoff
 YFINANCE_RETRIES: int = 4
-YFINANCE_BACKOFF_BASE: float = 3.0  # seconds; doubles each retry
+YFINANCE_BACKOFF_BASE: float = 10.0  # seconds; doubles each retry (10, 20, 40, 80s)
 
 # ---------------------------------------------------------------------------
 # Catalyst keywords used to classify news headlines
@@ -140,7 +140,8 @@ SMS_MAX_LENGTH: int = 1600  # Twilio concatenated SMS limit
 # ---------------------------------------------------------------------------
 
 # Maximum number of gapper candidates to retrieve from Finviz before scoring
-MAX_CANDIDATES: int = 30
+# Keep this ≤ 15 — larger batches increase rate-limit exposure
+MAX_CANDIDATES: int = 15
 
 # Finviz screener URL for gap-ups (populated in data_sources.py)
 FINVIZ_SCREENER_URL: str = (
