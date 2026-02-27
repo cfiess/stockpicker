@@ -107,15 +107,47 @@ NON_TICKERS: set = {
     "XLE", "XLK", "XLV", "XLI", "XLP", "XLU", "UVXY", "VXX",
     # Index tickers
     "SPX", "NDX", "RUT",
+    # Web / tech strings that appear in URLs and get extracted accidentally
+    "HTTP", "HTTPS", "HTML", "JSON", "REST", "API",
+    "WWW", "CSS", "PHP", "SQL", "AWS", "GCP", "CDN",
+    "GIT", "SSH", "TLS", "SSL", "DNS", "VPN", "DEV",
+    "APP", "SaaS", "SAAS", "PAAS", "IAAS",
 }
 
-_TICKER_PATTERN = re.compile(r'\b([A-Z]{1,5})\b')
+_URL_RE = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r'\[.*?\]\(.*?\)')
+_DOLLAR_TICKER_RE = re.compile(r'\$([A-Z]{1,5})\b')       # $AAPL style
+_CAPS_TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')          # already-uppercase words
 
 
 def extract_tickers(text: str) -> List[str]:
-    """Pull plausible ticker symbols out of free-form text."""
-    found = _TICKER_PATTERN.findall(text.upper())
-    return [t for t in found if t not in NON_TICKERS]
+    """
+    Pull plausible ticker symbols from free-form text.
+
+    Strategy:
+      1. Strip URLs and markdown links first — prevents HTTPS, WWW, etc.
+         from being mistaken for tickers.
+      2. Collect $TICKER mentions (dollar-prefixed, most reliable signal).
+      3. Collect standalone UPPERCASE words from the *original* text
+         (NOT after calling text.upper() — that's what caused HTTPS).
+      4. Filter through NON_TICKERS.
+    """
+    # Remove URLs before anything else
+    clean = _URL_RE.sub(" ", text)
+    clean = _MARKDOWN_LINK_RE.sub(" ", clean)
+
+    tickers: set = set()
+
+    # $TICKER format — explicit ticker mentions, highest confidence
+    for m in _DOLLAR_TICKER_RE.finditer(clean):
+        tickers.add(m.group(1))
+
+    # Already-uppercase words in the original (mixed-case) text
+    # "I bought NVDA calls" → NVDA matches; "https" → never uppercase → never matches
+    for m in _CAPS_TICKER_RE.finditer(clean):
+        tickers.add(m.group(1))
+
+    return [t for t in tickers if t not in NON_TICKERS]
 
 
 # ---------------------------------------------------------------------------
