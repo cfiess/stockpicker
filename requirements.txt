@@ -1,18 +1,20 @@
 # Stock Screener — Python dependencies
 # Install with: pip install -r requirements.txt
 
-# ── Market data ─────────────────────────────────────────────────────────────
-yfinance>=0.2.38            # Yahoo Finance OHLCV, news, ticker info
-requests>=2.31.0            # HTTP client (Finviz scraping, Alpaca API)
-beautifulsoup4>=4.12.3      # HTML parsing for Finviz screener table
-lxml>=5.1.0                 # Fast HTML parser (used by BeautifulSoup)
+# ── HTTP / scraping ──────────────────────────────────────────────────────────
+requests>=2.31.0            # HTTP client (Reddit, StockTwits, SEC EDGAR, Yahoo)
+beautifulsoup4>=4.12.3      # HTML parsing (Finviz, fallback scrapers)
+lxml>=5.1.0                 # Fast HTML/XML parser
 
-# ── SMS delivery ─────────────────────────────────────────────────────────────
-twilio>=9.0.0               # Twilio REST client for SMS
+# ── Environment ──────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0        # Load .env file
 
-# ── Environment / config ─────────────────────────────────────────────────────
-python-dotenv>=1.0.0        # Load .env file into os.environ
+# ── Timezone ─────────────────────────────────────────────────────────────────
+tzdata>=2024.1              # IANA timezone data (needed on some platforms)
 
-# ── Standard library backports / typing ──────────────────────────────────────
-# zoneinfo is built-in for Python 3.9+; backport needed for 3.8
-tzdata>=2024.1              # IANA timezone database (required on some platforms)
+# ── Optional: SMS delivery (only needed if you want text message output) ─────
+# twilio>=9.0.0
+
+# ── Optional: real-time price data (kept for future price enrichment) ─────────
+# yfinance>=0.2.38
+# pandas>=2.0.0

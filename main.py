@@ -1,25 +1,21 @@
 """
-main.py — Entry point and scheduler for the stock screener.
+main.py — Entry point for the signal-based stock screener.
+
+Outputs picks directly to the terminal (no SMS required).
 
 Usage
 -----
-  # Run once immediately (useful for testing / manual trigger)
-  python main.py --now
+  # Run immediately and print picks to screen
+  python main.py
 
-  # Run in dry-run mode (no SMS sent, output printed to stdout)
-  python main.py --now --dry-run
-
-  # Start the scheduler (runs every weekday at 9:45 ET)
+  # Keep running on a schedule (fires at 9:45 ET on weekdays)
   python main.py --schedule
 
-  # Override number of picks
-  python main.py --now --picks 3
+  # Show verbose scoring detail
+  python main.py --verbose
 
-Scheduling note
----------------
-The built-in scheduler keeps the process alive and fires the job at 9:45 ET
-every weekday.  For production deployments, a system cron entry is simpler
-and more reliable (see README.md for the recommended cron setup).
+  # Override number of picks
+  python main.py --picks 3
 """
 
 from __future__ import annotations
@@ -33,20 +29,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-
-# Load .env before importing anything that reads env vars
 load_dotenv()
 
-from config import NUM_PICKS, WEIGHTS
+from config import NUM_PICKS, SIGNAL_WEIGHTS
 from scorer import rank_candidates
-from screener import run_screen
-from sms_sender import build_no_picks_body, build_sms_body, send_sms
+from screener import CandidateStock, run_screen
 
 ET = ZoneInfo("America/New_York")
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -59,50 +48,90 @@ log = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
+# Output formatter
+# ---------------------------------------------------------------------------
+
+def _divider(char: str = "─", width: int = 60) -> str:
+    return char * width
+
+
+def format_pick(pick: CandidateStock, verbose: bool = False) -> str:
+    rank_label = "Primary" if pick.rank == 1 else "Backup"
+    lines = [
+        f"PICK {pick.rank} ({rank_label}): {pick.ticker}"
+        + (f"  [{pick.company_name}]" if pick.company_name else ""),
+        f"Catalyst : {pick.best_catalyst_label} — {pick.best_description}",
+        f"Social   : {pick.reddit_summary}",
+        f"StockTwits: {pick.stocktwits_summary}",
+        f"Sources  : {pick.sources_str}",
+        f"Why      : {pick.rank_reason}",
+    ]
+    if verbose:
+        lines.append(f"Score    : {pick.score:.3f}")
+    return "\n".join(lines)
+
+
+def print_picks(picks: list, verbose: bool = False) -> None:
+    now = datetime.now(ET)
+    date_str = now.strftime("%A %b %-d, %Y")
+    time_str = now.strftime("%-I:%M %p ET")
+
+    print()
+    print(_divider("═"))
+    print(f"  STOCK PICKS — {date_str}  |  {time_str}")
+    print(_divider("═"))
+
+    if not picks:
+        print("\n  No qualifying picks today.\n")
+        print(_divider("═"))
+        return
+
+    for pick in picks:
+        print()
+        print(format_pick(pick, verbose=verbose))
+
+    print()
+    print(_divider("─"))
+    print("  Signals: Reddit (WSB/stocks/options) · StockTwits · SEC EDGAR · Yahoo News")
+    print("  Not financial advice. Do your own due diligence before trading.")
+    print(_divider("═"))
+    print()
+
+
+def print_no_picks(reason: str) -> None:
+    now = datetime.now(ET)
+    print()
+    print(_divider("═"))
+    print(f"  STOCK PICKS — {now.strftime('%A %b %-d')}  |  No picks today")
+    print(_divider("─"))
+    print(f"  {reason}")
+    print(_divider("═"))
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Core job
 # ---------------------------------------------------------------------------
 
-def run_job(dry_run: bool = False, num_picks: int = NUM_PICKS) -> None:
-    """
-    Execute the full screen → rank → SMS pipeline.
-
-    This function is idempotent: safe to call multiple times.
-    """
+def run_job(num_picks: int = NUM_PICKS, verbose: bool = False) -> None:
     log.info("=" * 60)
-    log.info("Stock screener starting — %s", datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"))
+    log.info("Signal screener starting — %s", datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"))
     log.info("=" * 60)
 
-    # ── 1. Screen ─────────────────────────────────────────────────────────
-    candidates, spy_pct, spy_price = run_screen()
+    candidates = run_screen()
 
-    # ── 2. Handle no-candidates cases ─────────────────────────────────────
     if not candidates:
-        if spy_pct < 0:
-            reason = f"SPY is down {spy_pct * 100:.2f}% — unfavourable tape for long setups."
-        else:
-            reason = "No stocks met all three criteria (gap 2%+, catalyst, 2× volume)."
-
-        body = build_no_picks_body(spy_pct, reason)
-        log.info("No qualified candidates — sending no-picks SMS")
-        send_sms(body, dry_run=dry_run)
+        print_no_picks("No tickers met the minimum signal thresholds across all sources.")
         return
 
-    # ── 3. Score and rank ─────────────────────────────────────────────────
-    picks = rank_candidates(candidates, num_picks=num_picks, weights=WEIGHTS)
+    picks = rank_candidates(candidates, num_picks=num_picks, weights=SIGNAL_WEIGHTS)
 
     if not picks:
-        log.warning("rank_candidates returned empty list — aborting")
+        print_no_picks("Candidates found but scoring returned no picks.")
         return
 
-    # ── 4. Format and send SMS ────────────────────────────────────────────
-    body = build_sms_body(picks, spy_pct=spy_pct, spy_price=spy_price)
-    success = send_sms(body, dry_run=dry_run)
-
-    if success:
-        log.info("Job complete — %d pick(s) delivered", len(picks))
-    else:
-        log.error("Job complete — SMS delivery FAILED")
-        sys.exit(1)
+    print_picks(picks, verbose=verbose)
+    log.info("Done — %d pick(s) printed", len(picks))
 
 
 # ---------------------------------------------------------------------------
@@ -110,32 +139,20 @@ def run_job(dry_run: bool = False, num_picks: int = NUM_PICKS) -> None:
 # ---------------------------------------------------------------------------
 
 def _is_weekday(dt: datetime) -> bool:
-    return dt.weekday() < 5  # Mon=0 … Fri=4
+    return dt.weekday() < 5
 
 
 def run_scheduler(
     run_hour: int = 9,
     run_minute: int = 45,
-    dry_run: bool = False,
     num_picks: int = NUM_PICKS,
+    verbose: bool = False,
 ) -> None:
-    """
-    Block indefinitely, executing run_job() at *run_hour*:*run_minute* ET
-    on each weekday.
-
-    The scheduler polls once per minute to keep resource usage minimal.
-    """
-    log.info(
-        "Scheduler started — will fire at %02d:%02d ET on weekdays",
-        run_hour,
-        run_minute,
-    )
-
+    log.info("Scheduler started — fires at %02d:%02d ET on weekdays", run_hour, run_minute)
     last_run_date = None
 
     while True:
         now = datetime.now(ET)
-
         if (
             _is_weekday(now)
             and now.hour == run_hour
@@ -144,82 +161,55 @@ def run_scheduler(
         ):
             last_run_date = now.date()
             try:
-                run_job(dry_run=dry_run, num_picks=num_picks)
+                run_job(num_picks=num_picks, verbose=verbose)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Unhandled error in run_job: %s", exc)
 
-        # Sleep until the next minute boundary
-        sleep_seconds = 60 - now.second
-        time.sleep(sleep_seconds)
+        time.sleep(60 - now.second)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Intraday stock screener — runs at 9:45 ET and sends SMS picks"
-    )
-
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--now",
-        action="store_true",
-        help="Run the screener immediately (once) and exit",
-    )
-    mode.add_argument(
-        "--schedule",
-        action="store_true",
-        help="Start the scheduler (blocks until Ctrl-C)",
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=os.getenv("DRY_RUN", "false").lower() == "true",
-        help="Print SMS to stdout instead of sending via Twilio",
-    )
-    parser.add_argument(
-        "--picks",
-        type=int,
-        default=NUM_PICKS,
-        metavar="N",
-        help=f"Number of picks to include (default: {NUM_PICKS})",
-    )
-    parser.add_argument(
-        "--run-hour",
-        type=int,
-        default=9,
-        metavar="HH",
-        help="Scheduler fire hour in ET (default: 9)",
-    )
-    parser.add_argument(
-        "--run-minute",
-        type=int,
-        default=45,
-        metavar="MM",
-        help="Scheduler fire minute in ET (default: 45)",
-    )
-
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = _parse_args()
+    parser = argparse.ArgumentParser(
+        description="Signal-based day-trade screener — Reddit, StockTwits, SEC EDGAR"
+    )
+    parser.add_argument(
+        "--schedule", action="store_true",
+        help="Run on a schedule (fires at 9:45 ET weekdays)",
+    )
+    parser.add_argument(
+        "--picks", type=int, default=NUM_PICKS, metavar="N",
+        help=f"Number of picks to output (default: {NUM_PICKS})",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Show scoring detail for each pick",
+    )
+    parser.add_argument(
+        "--run-hour", type=int, default=9, metavar="HH",
+        help="Scheduler hour in ET (default: 9)",
+    )
+    parser.add_argument(
+        "--run-minute", type=int, default=45, metavar="MM",
+        help="Scheduler minute in ET (default: 45)",
+    )
+    args = parser.parse_args()
 
-    if args.now:
-        run_job(dry_run=args.dry_run, num_picks=args.picks)
-    elif args.schedule:
+    if args.schedule:
         try:
             run_scheduler(
                 run_hour=args.run_hour,
                 run_minute=args.run_minute,
-                dry_run=args.dry_run,
                 num_picks=args.picks,
+                verbose=args.verbose,
             )
         except KeyboardInterrupt:
-            log.info("Scheduler stopped by user")
+            log.info("Scheduler stopped")
+    else:
+        run_job(num_picks=args.picks, verbose=args.verbose)
 
 
 if __name__ == "__main__":

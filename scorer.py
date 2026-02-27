@@ -1,20 +1,20 @@
 """
-scorer.py — Conviction scoring engine.
+scorer.py — Signal-based conviction scoring engine.
 
-Each CandidateStock receives a composite score built from weighted sub-scores.
-All sub-scores are normalised to [0, 1] before weighting so that weights are
-directly comparable in magnitude.
+Each CandidateStock is scored across 7 weighted sub-factors.
+All sub-scores are normalised to [0, 1] before weighting.
 
-To retune the model, edit WEIGHTS in config.py — no code changes required.
+To retune the model: edit SignalWeights in config.py — no code changes needed.
 
 Sub-score breakdown
 -------------------
-  gap_pct          Larger gap → more momentum
-  rel_vol          Higher relative volume → more market conviction
-  catalyst_quality Ranked: earnings > acquisition > fda > upgrade > unknown
-  spy_tailwind     Stronger SPY green = better macro backdrop
-  low_float_bonus  Smaller float → larger price swings on volume
-  gap_held         Boolean bonus: stock still holding above prev close
+  sec_catalyst      Hard catalyst filed with SEC today (strongest signal)
+  cross_source      Ticker confirmed by 2+ independent sources
+  wsb_mentions      WSB mention count (retail momentum proxy)
+  stocktwits_rank   Position on StockTwits trending list
+  st_bullish        Fraction of StockTwits messages tagged "Bullish"
+  reddit_quality    Upvote-weighted Reddit engagement
+  news_sentiment    Positive news coverage
 """
 
 from __future__ import annotations
@@ -23,161 +23,140 @@ import logging
 import math
 from typing import List, Optional
 
-from config import CATALYST_QUALITY_RANK, NUM_PICKS, WEIGHTS, ScoringWeights
+from config import NUM_PICKS, SIGNAL_WEIGHTS, SignalWeights, SEC_CATALYST_QUALITY
 from screener import CandidateStock
 
 log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Normalisation helpers
 # ---------------------------------------------------------------------------
 
 def _sigmoid(x: float, midpoint: float, steepness: float = 1.0) -> float:
-    """Smooth S-curve normaliser; output always in (0, 1)."""
     return 1.0 / (1.0 + math.exp(-steepness * (x - midpoint)))
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, value))
+def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
 
 
 # ---------------------------------------------------------------------------
-# Individual sub-scorers  (each returns a value in [0, 1])
+# Sub-scorers (each returns [0, 1])
 # ---------------------------------------------------------------------------
 
-def _score_gap(gap_pct: float) -> float:
-    """
-    Gap of 2% → 0.0 baseline; 10% → ~0.9; 20%+ → approaches 1.0.
-    Midpoint at 8% — stocks gapping more than 8% get above-median scores.
-    """
-    # shift so 2% (our minimum) anchors near 0
-    adjusted = (gap_pct * 100) - 2.0          # 2% gap → 0, 10% gap → 8
-    return _clamp(_sigmoid(adjusted, midpoint=6.0, steepness=0.25))
+def _score_sec_catalyst(catalyst_type: str) -> float:
+    """Use the quality rank from config — earnings=1.0, unknown=0.0."""
+    return SEC_CATALYST_QUALITY.get(catalyst_type, 0.0)
 
 
-def _score_rel_vol(rel_vol: float) -> float:
-    """
-    RelVol 2× → baseline; 5× → ~0.75; 10×+ → approaches 1.0.
-    """
-    return _clamp(_sigmoid(rel_vol, midpoint=4.0, steepness=0.4))
+def _score_cross_source(source_count: int) -> float:
+    """1 source → 0.25 | 2 → 0.65 | 3 → 0.90 | 4+ → 1.0"""
+    return _clamp(_sigmoid(source_count, midpoint=2.0, steepness=1.5))
 
 
-def _score_catalyst(catalyst_type: str) -> float:
-    """Lookup table from config.py."""
-    return CATALYST_QUALITY_RANK.get(catalyst_type, 0.2)
+def _score_wsb_mentions(mentions: int) -> float:
+    """0 → 0.0 | 5 → ~0.5 | 20 → ~0.9 | 50+ → ~1.0"""
+    return _clamp(_sigmoid(mentions, midpoint=10.0, steepness=0.15))
 
 
-def _score_spy(spy_pct: float) -> float:
-    """
-    SPY 0% → 0.0; SPY +1% → ~0.73; SPY +2%+ → approaches 1.0.
-    Negative SPY already filtered out; mild green still gets a lower score.
-    """
-    pct = spy_pct * 100  # convert to percentage points
-    return _clamp(_sigmoid(pct, midpoint=0.75, steepness=1.5))
+def _score_stocktwits_rank(rank: int) -> float:
+    """Rank 1 → 1.0 | Rank 15 → ~0.4 | Not trending (0) → 0.0"""
+    if rank == 0:
+        return 0.0
+    return _clamp(1.0 - (rank - 1) / 20.0)
 
 
-def _score_float(float_shares: int) -> float:
-    """
-    Lower float = higher score.  Measured in millions of shares.
-    <10M float → 1.0; 50M → ~0.5; 200M+ → approaches 0.0.
-    Stocks with unknown float (0) get a neutral 0.5.
-    """
-    if float_shares <= 0:
-        return 0.5
-
-    float_m = float_shares / 1_000_000
-    return _clamp(1.0 - _sigmoid(float_m, midpoint=50.0, steepness=0.05))
+def _score_st_bullish(bullish_pct: float) -> float:
+    """50% (neutral) → 0.5 | 70% → ~0.85 | 90% → ~1.0"""
+    return _clamp(_sigmoid(bullish_pct, midpoint=0.55, steepness=8.0))
 
 
-def _score_gap_held(gap_held: bool) -> float:
-    """Binary: full credit if gap held, zero otherwise."""
-    return 1.0 if gap_held else 0.0
+def _score_reddit_quality(post_score: int, mention_count: int) -> float:
+    """Combined engagement: upvotes + 2× mentions. 1000 → ~0.5; 5000+ → 1.0"""
+    engagement = post_score + 2 * mention_count
+    return _clamp(_sigmoid(engagement, midpoint=1000.0, steepness=0.002))
+
+
+def _score_news_sentiment(sentiment: float, catalyst_type: str) -> float:
+    """Boost if news has a known catalyst type; otherwise raw sentiment score."""
+    if catalyst_type not in ("unknown", ""):
+        return _clamp(sentiment + 0.2)
+    return _clamp(sentiment)
 
 
 # ---------------------------------------------------------------------------
 # Composite scorer
 # ---------------------------------------------------------------------------
 
-def compute_score(candidate: CandidateStock, weights: ScoringWeights = WEIGHTS) -> float:
-    """
-    Return a composite conviction score for *candidate*.
+def compute_score(
+    c: CandidateStock,
+    weights: Optional[SignalWeights] = None,
+) -> float:
+    """Return a composite conviction score. Score = Σ(weight_i × sub_score_i)."""
+    if weights is None:
+        weights = SIGNAL_WEIGHTS
 
-    Score = Σ( weight_i × sub_score_i )
-
-    The absolute value means nothing on its own — use it only for ranking.
-    """
     sub_scores = {
-        "gap_pct": (weights.gap_pct, _score_gap(candidate.gap_pct)),
-        "rel_vol": (weights.rel_vol, _score_rel_vol(candidate.rel_vol)),
-        "catalyst_quality": (weights.catalyst_quality, _score_catalyst(candidate.catalyst_type)),
-        "spy_tailwind": (weights.spy_tailwind, _score_spy(candidate.spy_pct)),
-        "low_float_bonus": (weights.low_float_bonus, _score_float(candidate.float_shares)),
-        "gap_held": (weights.gap_held, _score_gap_held(candidate.gap_held)),
+        "sec_catalyst":   (weights.sec_catalyst,    _score_sec_catalyst(c.sec_catalyst_type)),
+        "cross_source":   (weights.cross_source,    _score_cross_source(c.source_count)),
+        "wsb_mentions":   (weights.wsb_mentions,    _score_wsb_mentions(c.wsb_mentions)),
+        "st_rank":        (weights.stocktwits_rank, _score_stocktwits_rank(c.stocktwits_rank)),
+        "st_bullish":     (weights.st_bullish,      _score_st_bullish(c.stocktwits_bullish_pct)),
+        "reddit_quality": (weights.reddit_quality,  _score_reddit_quality(
+                              c.reddit_post_score, c.reddit_mentions)),
+        "news_sentiment": (weights.news_sentiment,  _score_news_sentiment(
+                              c.news_sentiment, c.news_catalyst_type)),
     }
 
     total = sum(w * s for _, (w, s) in sub_scores.items())
 
     log.debug(
         "%s | score=%.3f | %s",
-        candidate.ticker,
+        c.ticker,
         total,
-        "  ".join(f"{k}={s:.2f}(×{w})" for k, (w, s) in sub_scores.items()),
+        "  ".join(f"{k}={s:.2f}(×{w:.1f})" for k, (w, s) in sub_scores.items()),
     )
-
     return round(total, 4)
 
 
 # ---------------------------------------------------------------------------
-# Ranking rationale builder
+# Ranking reason builder
 # ---------------------------------------------------------------------------
 
-_RANK1_TEMPLATES = [
-    (
-        "catalyst_quality",
-        lambda c: c.catalyst_type in ("earnings", "fda"),
-        "Ranked #1 for a high-conviction {catalyst_label} catalyst paired with "
-        "{rel_vol}x relative volume — the strongest setup today.",
-    ),
-    (
-        "rel_vol",
-        lambda c: c.rel_vol >= 5.0,
-        "Ranked #1 because extreme relative volume ({rel_vol}x) signals unusual "
-        "institutional interest, amplifying the {gap_pct} gap.",
-    ),
-    (
-        "gap_held",
-        lambda c: c.gap_held and c.gap_pct >= 0.05,
-        "Ranked #1 for holding a large {gap_pct} gap on {rel_vol}x volume — "
-        "sellers are absent and momentum is clean.",
-    ),
-    (
-        "default",
-        lambda c: True,
-        "Ranked #1 as the highest-scoring setup overall: {gap_pct} gap, "
-        "{rel_vol}x volume, and a {catalyst_label} catalyst in a positive tape.",
-    ),
-]
-
-_RANK2_TEMPLATES = [
-    (
-        "backup_different_catalyst",
-        lambda c: True,
-        "Ranked #2 as the strongest backup: {gap_pct} gap on {rel_vol}x volume "
-        "with a {catalyst_label} catalyst — offers diversification if #1 stalls.",
-    ),
-]
-
-
-def _build_reason(candidate: CandidateStock, rank: int) -> str:
-    templates = _RANK1_TEMPLATES if rank == 1 else _RANK2_TEMPLATES
-    for _, condition, template in templates:
-        if condition(candidate):
-            return template.format(
-                catalyst_label=candidate.catalyst_label,
-                rel_vol=candidate.rel_vol_str,
-                gap_pct=candidate.gap_pct_str,
+def _build_reason(c: CandidateStock, rank: int) -> str:
+    if rank == 1:
+        if c.sec_catalyst_type in ("earnings", "fda"):
+            return (
+                f"Ranked #1 for a high-conviction {c.best_catalyst_label} catalyst "
+                f"confirmed by {c.sources_str}."
             )
-    return f"Ranked #{rank} by composite conviction score."
+        if c.source_count >= 3:
+            return (
+                f"Ranked #1 for appearing across {c.source_count} independent sources "
+                f"({c.sources_str}) — rare multi-signal confirmation."
+            )
+        if c.wsb_mentions >= 10:
+            return (
+                f"Ranked #1 for {c.wsb_mentions} WSB mentions driving retail momentum, "
+                f"backed by {c.sources_str}."
+            )
+        if c.stocktwits_rank > 0:
+            return (
+                f"Ranked #1 as StockTwits trending #{c.stocktwits_rank} with "
+                f"{int(c.stocktwits_bullish_pct * 100)}% bullish sentiment."
+            )
+        return f"Ranked #1 as the highest composite signal today via {c.sources_str}."
+    else:
+        if c.sec_catalyst_type:
+            return (
+                f"Ranked #2 as backup — {c.best_catalyst_label} catalyst on SEC "
+                f"filing provides a hard fundamental reason for a move."
+            )
+        return (
+            f"Ranked #2 as the strongest backup: {c.reddit_mentions} Reddit mentions "
+            f"and {c.stocktwits_summary.lower()} offer diversification from Pick 1."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -187,35 +166,29 @@ def _build_reason(candidate: CandidateStock, rank: int) -> str:
 def rank_candidates(
     candidates: List[CandidateStock],
     num_picks: int = NUM_PICKS,
-    weights: ScoringWeights = WEIGHTS,
+    weights: Optional[SignalWeights] = None,
 ) -> List[CandidateStock]:
-    """
-    Score every candidate, sort by score descending, and assign ranks
-    and ranking reasons to the top *num_picks*.
-
-    Returns only the top *num_picks* candidates with .score, .rank,
-    and .rank_reason populated.
-    """
+    """Score, sort, and assign ranks + reasons to the top *num_picks* candidates."""
     if not candidates:
         return []
 
-    for candidate in candidates:
-        candidate.score = compute_score(candidate, weights)
+    if weights is None:
+        weights = SIGNAL_WEIGHTS
+
+    for c in candidates:
+        c.score = compute_score(c, weights)
 
     candidates.sort(key=lambda c: c.score, reverse=True)
-
     picks = candidates[:num_picks]
+
     for i, pick in enumerate(picks, start=1):
         pick.rank = i
         pick.rank_reason = _build_reason(pick, i)
         log.info(
-            "Pick #%d: %s (score=%.3f, gap=%.1f%%, relvol=%.1f×, catalyst=%s)",
-            i,
-            pick.ticker,
-            pick.score,
-            pick.gap_pct * 100,
-            pick.rel_vol,
-            pick.catalyst_type,
+            "Pick #%d: %s (score=%.3f, sources=%s, wsb=%d, st_rank=%s, catalyst=%s)",
+            i, pick.ticker, pick.score, pick.sources_str,
+            pick.wsb_mentions, pick.stocktwits_rank or "—",
+            pick.best_catalyst_type,
         )
 
     return picks

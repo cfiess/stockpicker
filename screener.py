@@ -1,15 +1,16 @@
 """
-screener.py — Filter pipeline that turns a raw gapper list into
-              qualified trade candidates.
+screener.py — Signal-based screening pipeline.
 
-Pipeline stages
----------------
-1. Fetch tickers from Finviz gap-up screener
-2. For each ticker: pull price data, validate gap ≥ 2%
-3. Detect catalyst from news headlines
-4. Compute relative volume; require ≥ 2× average
-5. Confirm SPY is positive on the day
-6. Return a list of CandidateStock objects ready for scoring
+Pipeline
+--------
+1. Gather Reddit mentions  (WSB + r/stocks + r/options + r/pennystocks)
+2. Gather StockTwits trending symbols
+3. Gather SEC EDGAR 8-K filings from the last 24 hours
+4. Merge all three into a unified candidate pool
+5. Enrich each candidate: StockTwits sentiment + Yahoo Finance news
+6. Return CandidateStock objects ready for scoring
+
+No real-time price data required.  No yfinance calls in this module.
 """
 
 from __future__ import annotations
@@ -17,26 +18,23 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from config import (
     CATALYST_LABELS,
-    ENTRY_BUFFER_PCT,
-    MIN_GAP_PCT,
-    MIN_REL_VOL,
-    MIN_SPY_PCT,
+    MAX_CANDIDATES,
+    MIN_REDDIT_MENTIONS,
+    MIN_SOURCES,
     REQUEST_DELAY,
-    STOP_LOSS_BELOW_LOW_PCT,
 )
-from data_sources import (
-    batch_fetch_avg_daily_volume,
-    batch_fetch_price_data,
-    classify_catalyst,
-    compute_rel_vol,
-    get_alpaca_quote,
-    get_gappers,
-    get_news_headlines,
-    get_spy_status,
+from signals import (
+    SignalData,
+    aggregate_signals,
+    get_reddit_mentions,
+    get_sec_catalysts,
+    get_stocktwits_sentiment,
+    get_stocktwits_trending,
+    get_yahoo_news,
 )
 
 log = logging.getLogger(__name__)
@@ -48,179 +46,177 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class CandidateStock:
-    """All information needed for scoring and SMS formatting."""
+    """All signal data needed for scoring and output formatting."""
 
     ticker: str
-    gap_pct: float                  # e.g. 0.05 = 5% gap
-    gap_held: bool                  # price still above prev close
-    catalyst_type: str              # earnings | fda | analyst_upgrade | acquisition | unknown
-    catalyst_summary: str           # 1-line headline
-    rel_vol: float                  # e.g. 3.2 = 3.2× average volume
-    current_price: float
-    open_price: float
-    prev_close: float
-    high_of_day: float
-    low_of_day: float
-    float_shares: int               # 0 if unknown
-    spy_pct: float                  # SPY % change on the day
-    spy_price: float
-    score: float = 0.0              # filled in by scorer.py
-    rank: int = 0                   # 1 = primary, 2 = backup
-    rank_reason: str = ""           # one-sentence explanation
+    company_name: str = ""
 
-    # Derived fields filled by screener
-    entry_low: float = 0.0
-    entry_high: float = 0.0
-    stop_loss: float = 0.0
+    # Reddit signals
+    reddit_mentions: int = 0
+    wsb_mentions: int = 0
+    reddit_post_score: int = 0
+    reddit_subreddits: List[str] = field(default_factory=list)
+    reddit_sentiment: float = 0.5
 
-    def __post_init__(self) -> None:
-        self._compute_levels()
+    # StockTwits signals
+    stocktwits_rank: int = 0
+    stocktwits_watchers: int = 0
+    stocktwits_bullish_pct: float = 0.5
+    stocktwits_message_count: int = 0
 
-    def _compute_levels(self) -> None:
-        """Calculate entry zone and stop-loss from price data."""
-        price = self.current_price
-        self.entry_low = round(price * (1 - ENTRY_BUFFER_PCT), 2)
-        self.entry_high = round(price * (1 + ENTRY_BUFFER_PCT), 2)
-        self.stop_loss = round(self.low_of_day * (1 - STOP_LOSS_BELOW_LOW_PCT), 2)
+    # SEC catalyst
+    sec_catalyst_type: str = ""     # earnings | fda | acquisition | deal | unknown
+    sec_description: str = ""
 
-    @property
-    def catalyst_label(self) -> str:
-        return CATALYST_LABELS.get(self.catalyst_type, "News Catalyst")
+    # News
+    news_headline: str = ""
+    news_catalyst_type: str = ""
+    news_sentiment: float = 0.5
+
+    # Meta
+    sources: List[str] = field(default_factory=list)
+    score: float = 0.0
+    rank: int = 0
+    rank_reason: str = ""
+
+    # ── Derived helpers ────────────────────────────────────────────────────
 
     @property
-    def entry_zone_str(self) -> str:
-        return f"${self.entry_low:.2f}–${self.entry_high:.2f}"
+    def source_count(self) -> int:
+        return len(self.sources)
 
     @property
-    def gap_pct_str(self) -> str:
-        return f"{self.gap_pct * 100:.1f}%"
+    def best_catalyst_type(self) -> str:
+        return self.sec_catalyst_type or self.news_catalyst_type or "unknown"
 
     @property
-    def rel_vol_str(self) -> str:
-        return f"{self.rel_vol:.1f}x"
+    def best_catalyst_label(self) -> str:
+        return CATALYST_LABELS.get(self.best_catalyst_type, "News Catalyst")
+
+    @property
+    def best_description(self) -> str:
+        return self.sec_description or self.news_headline or "No catalyst description available"
+
+    @property
+    def sources_str(self) -> str:
+        return ", ".join(self.sources) if self.sources else "—"
+
+    @property
+    def reddit_summary(self) -> str:
+        if self.reddit_mentions == 0:
+            return "No Reddit mentions"
+        subs = " + ".join(f"r/{s.replace('r/', '')}" for s in self.reddit_subreddits[:3])
+        return f"{self.reddit_mentions} mentions ({subs})"
+
+    @property
+    def stocktwits_summary(self) -> str:
+        if self.stocktwits_rank == 0:
+            return "Not trending"
+        bullish_pct = int(self.stocktwits_bullish_pct * 100)
+        return f"Trending #{self.stocktwits_rank}, {bullish_pct}% bullish"
+
+
+# ---------------------------------------------------------------------------
+# Helper: build CandidateStock from SignalData
+# ---------------------------------------------------------------------------
+
+def _signal_to_candidate(sd: SignalData) -> CandidateStock:
+    return CandidateStock(
+        ticker=sd.ticker,
+        company_name=sd.company_name,
+        reddit_mentions=sd.reddit_mentions,
+        wsb_mentions=sd.wsb_mentions,
+        reddit_post_score=sd.reddit_post_score,
+        reddit_subreddits=list(sd.reddit_subreddits),
+        reddit_sentiment=sd.reddit_sentiment,
+        stocktwits_rank=sd.stocktwits_rank,
+        stocktwits_watchers=sd.stocktwits_watchers,
+        sec_catalyst_type=sd.sec_catalyst_type,
+        sec_description=sd.sec_description,
+        sources=list(sd.sources),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main screening function
 # ---------------------------------------------------------------------------
 
-def run_screen(
-    min_gap_pct: float = MIN_GAP_PCT,
-    min_rel_vol: float = MIN_REL_VOL,
-    min_spy_pct: float = MIN_SPY_PCT,
-) -> Tuple[List[CandidateStock], float, float]:
+def run_screen() -> List[CandidateStock]:
     """
-    Execute the full screening pipeline.
+    Run the full signal-based screening pipeline.
 
-    Returns:
-        (candidates, spy_pct, spy_price)
-
-    *candidates* is a list of CandidateStock objects that passed all filters,
-    sorted by gap size descending (scorer.py will re-rank them by conviction).
+    Returns a list of CandidateStock objects, pre-sorted by source count
+    descending.  scorer.py will re-rank by composite conviction score.
     """
 
-    # ── Step 1: SPY gate ─────────────────────────────────────────────────────
-    spy_pct, spy_price = get_spy_status()
-    if spy_pct < min_spy_pct:
-        log.info(
-            "SPY gate FAILED: SPY is %.2f%% — skipping screen for today",
-            spy_pct * 100,
-        )
-        return [], spy_pct, spy_price
+    # ── Step 1: Gather signals in parallel (sequential here, fast enough) ──
+    log.info("Gathering Reddit mentions…")
+    reddit_signals = get_reddit_mentions(hours_back=24)
 
-    log.info("SPY gate PASSED: SPY +%.2f%%", spy_pct * 100)
+    log.info("Gathering StockTwits trending…")
+    st_signals = get_stocktwits_trending(max_symbols=30)
 
-    # ── Step 2: Fetch gapper candidates from Finviz ──────────────────────────
-    raw_tickers = get_gappers(min_gap_pct=min_gap_pct)
+    log.info("Gathering SEC EDGAR 8-K filings…")
+    sec_signals = get_sec_catalysts(hours_back=24)
 
-    if not raw_tickers:
-        log.warning("No gapper candidates returned from Finviz")
-        return [], spy_pct, spy_price
-
-    # ── Step 3: Batch fetch price data (2 API calls for ALL tickers) ─────────
-    # This is the key change vs. the old approach which made 2 calls *per ticker*.
-    batch_prices = batch_fetch_price_data(raw_tickers)
-    batch_avg_vols = batch_fetch_avg_daily_volume(raw_tickers)
-
-    # ── Step 4: Per-ticker filtering (no yfinance calls inside this loop) ────
-    candidates: List[CandidateStock] = []
-
-    for ticker in raw_tickers:
-        log.info("Evaluating %s …", ticker)
-
-        # 4a. Price / gap data — from pre-fetched batch, no API call
-        stock = batch_prices.get(ticker)
-        if stock is None:
-            log.debug("%s: skipped — no price data in batch", ticker)
-            continue
-
-        if stock["gap_pct"] < min_gap_pct:
-            log.debug(
-                "%s: skipped — gap %.2f%% < threshold %.2f%%",
-                ticker,
-                stock["gap_pct"] * 100,
-                min_gap_pct * 100,
-            )
-            continue
-
-        # 4b. Relative volume — computed from pre-fetched avg, no API call
-        avg_daily_vol = batch_avg_vols.get(ticker, 0.0)
-        rel_vol = compute_rel_vol(stock["volume_today"], avg_daily_vol)
-        if rel_vol < min_rel_vol:
-            log.debug(
-                "%s: skipped — rel_vol %.2f < threshold %.2f",
-                ticker, rel_vol, min_rel_vol,
-            )
-            continue
-
-        # 4c. News catalyst — one API call per ticker; pace with sleep
-        time.sleep(REQUEST_DELAY)
-        headlines = get_news_headlines(ticker)
-        catalyst_type, catalyst_summary = classify_catalyst(headlines)
-
-        if catalyst_type == "unknown" and not headlines:
-            log.debug("%s: skipped — no news catalyst found", ticker)
-            continue
-
-        log.info(
-            "%s QUALIFIED: gap=%.1f%%, relvol=%.1f×, catalyst=%s",
-            ticker,
-            stock["gap_pct"] * 100,
-            rel_vol,
-            catalyst_type,
-        )
-
-        # 4d. Optionally refine entry price with Alpaca real-time quote
-        current_price = stock["current_price"]
-        alpaca_quote = get_alpaca_quote(ticker)
-        if alpaca_quote and alpaca_quote["last"] > 0:
-            current_price = alpaca_quote["last"]
-            log.debug("%s: using Alpaca real-time price $%.2f", ticker, current_price)
-
-        candidate = CandidateStock(
-            ticker=ticker,
-            gap_pct=stock["gap_pct"],
-            gap_held=stock["gap_held"],
-            catalyst_type=catalyst_type,
-            catalyst_summary=catalyst_summary,
-            rel_vol=rel_vol,
-            current_price=current_price,
-            open_price=stock["open"],
-            prev_close=stock["prev_close"],
-            high_of_day=stock["high"],
-            low_of_day=stock["low"],
-            float_shares=stock["float_shares"],
-            spy_pct=spy_pct,
-            spy_price=spy_price,
-        )
-        candidates.append(candidate)
-
-    log.info(
-        "Screening complete: %d candidates qualified out of %d evaluated",
-        len(candidates),
-        len(raw_tickers),
+    # ── Step 2: Merge into unified candidate pool ──────────────────────────
+    merged = aggregate_signals(
+        reddit=reddit_signals,
+        stocktwits=st_signals,
+        sec=sec_signals,
+        min_sources=MIN_SOURCES,
     )
 
-    # Sort by gap size descending as pre-sort before scorer re-ranks
-    candidates.sort(key=lambda c: c.gap_pct, reverse=True)
-    return candidates, spy_pct, spy_price
+    if not merged:
+        log.warning("No candidates after signal aggregation")
+        return []
+
+    # ── Step 3: Enrich with StockTwits sentiment + news (top N only) ───────
+    # Sort by rough signal strength before enrichment to limit API calls
+    top_candidates = sorted(
+        merged.values(),
+        key=lambda sd: (sd.source_count, sd.wsb_mentions + sd.stocktwits_rank * 2),
+        reverse=True,
+    )[:MAX_CANDIDATES]
+
+    candidates: List[CandidateStock] = []
+
+    for sd in top_candidates:
+        c = _signal_to_candidate(sd)
+
+        # StockTwits per-ticker sentiment (skipped if not trending)
+        if sd.stocktwits_rank > 0:
+            time.sleep(REQUEST_DELAY)
+            bullish_pct, msg_count = get_stocktwits_sentiment(sd.ticker)
+            c.stocktwits_bullish_pct = bullish_pct
+            c.stocktwits_message_count = msg_count
+
+        # Yahoo Finance news
+        time.sleep(REQUEST_DELAY)
+        headline, catalyst_type, sentiment = get_yahoo_news(sd.ticker)
+        c.news_headline = headline
+        c.news_catalyst_type = catalyst_type
+        c.news_sentiment = sentiment
+
+        # News adds a source if it has a known catalyst
+        if catalyst_type != "unknown" and "News" not in c.sources:
+            c.sources.append("News")
+
+        # Reddit mention threshold filter
+        if c.reddit_mentions < MIN_REDDIT_MENTIONS and c.stocktwits_rank == 0 and not c.sec_catalyst_type:
+            log.debug("%s: skipped — below all signal thresholds", c.ticker)
+            continue
+
+        log.info(
+            "%s: sources=%s  wsb=%d  st_rank=%s  catalyst=%s",
+            c.ticker,
+            c.sources_str,
+            c.wsb_mentions,
+            c.stocktwits_rank or "—",
+            c.best_catalyst_type,
+        )
+        candidates.append(c)
+
+    log.info("Screening complete: %d qualified candidates", len(candidates))
+    candidates.sort(key=lambda c: (c.source_count, c.wsb_mentions), reverse=True)
+    return candidates
