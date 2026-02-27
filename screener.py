@@ -191,9 +191,11 @@ def run_screen() -> List[CandidateStock]:
             c.stocktwits_bullish_pct = bullish_pct
             c.stocktwits_message_count = msg_count
 
-        # Yahoo Finance news
+        # Yahoo Finance news + company name (same API call)
         time.sleep(REQUEST_DELAY)
-        headline, catalyst_type, sentiment = get_yahoo_news(sd.ticker)
+        company_name, headline, catalyst_type, sentiment = get_yahoo_news(sd.ticker)
+        if company_name and not c.company_name:
+            c.company_name = company_name
         c.news_headline = headline
         c.news_catalyst_type = catalyst_type
         c.news_sentiment = sentiment

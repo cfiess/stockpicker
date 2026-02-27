@@ -57,9 +57,9 @@ def _divider(char: str = "─", width: int = 60) -> str:
 
 def format_pick(pick: CandidateStock, verbose: bool = False) -> str:
     rank_label = "Primary" if pick.rank == 1 else "Backup"
+    company = pick.company_name if pick.company_name else "Unknown Company"
     lines = [
-        f"PICK {pick.rank} ({rank_label}): {pick.ticker}"
-        + (f"  [{pick.company_name}]" if pick.company_name else ""),
+        f"PICK {pick.rank} ({rank_label}): {pick.ticker} — {company}",
         f"Catalyst : {pick.best_catalyst_label} — {pick.best_description}",
         f"Social   : {pick.reddit_summary}",
         f"StockTwits: {pick.stocktwits_summary}",

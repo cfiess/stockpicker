@@ -555,22 +555,30 @@ def _classify_news_catalyst(title: str) -> str:
     return "unknown"
 
 
-def get_yahoo_news(ticker: str, max_items: int = 5) -> Tuple[str, str, float]:
+def get_yahoo_news(ticker: str, max_items: int = 5) -> Tuple[str, str, str, float]:
     """
     Fetch Yahoo Finance news for *ticker*.
 
-    Returns (best_headline, catalyst_type, sentiment_score).
-    Uses a direct Yahoo Finance RSS-style API — no yfinance Ticker object.
+    Returns (company_name, best_headline, catalyst_type, sentiment_score).
+    company_name comes from the quotes[0].shortname field in the same response.
+    Uses a direct Yahoo Finance search API — no yfinance Ticker object.
     """
     url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}&newsCount={max_items}"
     try:
         resp = _SESSION.get(url, timeout=8)
         resp.raise_for_status()
-        news_items = resp.json().get("news", [])
+        payload = resp.json()
     except Exception as exc:  # noqa: BLE001
         log.debug("%s: Yahoo news fetch error — %s", ticker, exc)
-        return "", "unknown", 0.5
+        return "", "", "unknown", 0.5
 
+    # Company name from the top quote result
+    company_name = ""
+    quotes = payload.get("quotes", [])
+    if quotes:
+        company_name = quotes[0].get("shortname") or quotes[0].get("longname") or ""
+
+    news_items = payload.get("news", [])
     best_headline = ""
     best_catalyst = "unknown"
     best_sentiment = 0.5
@@ -589,7 +597,7 @@ def get_yahoo_news(ticker: str, max_items: int = 5) -> Tuple[str, str, float]:
             best_catalyst = catalyst
             best_sentiment = sentiment
 
-    return best_headline, best_catalyst, best_sentiment
+    return company_name, best_headline, best_catalyst, best_sentiment
 
 
 # ---------------------------------------------------------------------------
