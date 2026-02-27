@@ -327,7 +327,7 @@ def get_stocktwits_trending(max_symbols: int = 30) -> Dict[str, SignalData]:
 
     for rank, sym in enumerate(symbols[:max_symbols], start=1):
         ticker = sym.get("symbol", "").upper()
-        if not ticker or not _TICKER_PATTERN.match(ticker) or ticker in NON_TICKERS:
+        if not ticker or not _CAPS_TICKER_RE.match(ticker) or ticker in NON_TICKERS:
             continue
 
         sd = SignalData(
