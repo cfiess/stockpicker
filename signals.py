@@ -112,6 +112,13 @@ NON_TICKERS: set = {
     "WWW", "CSS", "PHP", "SQL", "AWS", "GCP", "CDN",
     "GIT", "SSH", "TLS", "SSL", "DNS", "VPN", "DEV",
     "APP", "SaaS", "SAAS", "PAAS", "IAAS",
+    # AI / tech buzzwords that flood Reddit posts but are not unambiguous tickers
+    "AI", "ML", "DL", "NLP", "LLM", "GPT", "AGI",
+    "VR", "AR", "XR", "IOT", "EV", "ESG", "NFT",
+    "DAO", "DEX", "DCA", "APR", "APY",
+    # Common financial/news abbreviations that aren't tickers
+    "PR", "IR", "HR", "HQ", "MO", "VC", "PE", "LP",
+    "LLC", "INC", "LTD", "PLC", "CORP",
 }
 
 _URL_RE = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)

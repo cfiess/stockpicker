@@ -204,6 +204,15 @@ def run_screen() -> List[CandidateStock]:
         if catalyst_type != "unknown" and "News" not in c.sources:
             c.sources.append("News")
 
+        # Reality check: if Yahoo can't identify it as a company AND
+        # it has no hard SEC catalyst AND it's not on StockTwits trending,
+        # it's likely a false ticker extracted from general text (e.g. "AI")
+        if (not c.company_name
+                and not c.sec_catalyst_type
+                and c.stocktwits_rank == 0):
+            log.debug("%s: skipped — unverified ticker (no company name, no hard signal)", c.ticker)
+            continue
+
         # Reddit mention threshold filter
         if c.reddit_mentions < MIN_REDDIT_MENTIONS and c.stocktwits_rank == 0 and not c.sec_catalyst_type:
             log.debug("%s: skipped — below all signal thresholds", c.ticker)
