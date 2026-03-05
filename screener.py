@@ -5,7 +5,7 @@ Pipeline
 --------
 1. Gather Reddit mentions  (WSB + r/stocks + r/options + r/pennystocks)
 2. Gather StockTwits trending symbols
-3. Gather SEC EDGAR 8-K filings from the last 24 hours
+3. Gather SEC EDGAR 8-K filings from the last 24 hours (Reddit: REDDIT_LOOKBACK_HOURS)
 4. Merge all three into a unified candidate pool
 5. Enrich each candidate: StockTwits sentiment + Yahoo Finance news
 6. Return CandidateStock objects ready for scoring
@@ -25,6 +25,7 @@ from config import (
     MAX_CANDIDATES,
     MIN_REDDIT_MENTIONS,
     MIN_SOURCES,
+    REDDIT_LOOKBACK_HOURS,
     REQUEST_DELAY,
 )
 from signals import (
@@ -151,7 +152,7 @@ def run_screen() -> List[CandidateStock]:
 
     # ── Step 1: Gather signals in parallel (sequential here, fast enough) ──
     log.info("Gathering Reddit mentions…")
-    reddit_signals = get_reddit_mentions(hours_back=24)
+    reddit_signals = get_reddit_mentions(hours_back=REDDIT_LOOKBACK_HOURS)
 
     log.info("Gathering StockTwits trending…")
     st_signals = get_stocktwits_trending(max_symbols=30)

@@ -78,6 +78,27 @@ def _score_reddit_quality(post_score: int, mention_count: int) -> float:
     return _clamp(_sigmoid(engagement, midpoint=1000.0, steepness=0.002))
 
 
+def _score_reddit_sentiment(sentiment: float) -> float:
+    """
+    Convert raw reddit_sentiment (0–1, 0.5=neutral) to a sub-score.
+
+    Uses a sigmoid centred at 0.55 so net-neutral posts score ~0.5 and
+    clearly bearish threads (< 0.35) score near 0.
+    """
+    return _clamp(_sigmoid(sentiment, midpoint=0.55, steepness=10.0))
+
+
+def _sentiment_multiplier(sentiment: float) -> float:
+    """
+    Dampening multiplier applied to the WSB mention sub-score.
+
+    Bearish chatter (sentiment < 0.5) reduces the mention score so
+    pile-ons like "RKLB is cooked" don't inflate rankings.
+    Bullish/neutral chatter (>= 0.5) leaves the score untouched (cap at 1.0).
+    """
+    return _clamp(sentiment * 2.0)
+
+
 def _score_news_sentiment(sentiment: float, catalyst_type: str) -> float:
     """Boost if news has a known catalyst type; otherwise raw sentiment score."""
     if catalyst_type not in ("unknown", ""):
@@ -97,16 +118,21 @@ def compute_score(
     if weights is None:
         weights = SIGNAL_WEIGHTS
 
+    # WSB mention score is dampened by reddit sentiment so bearish pile-ons
+    # don't inflate rankings (e.g. "RKLB is cooked" threads).
+    wsb_score = _score_wsb_mentions(c.wsb_mentions) * _sentiment_multiplier(c.reddit_sentiment)
+
     sub_scores = {
-        "sec_catalyst":   (weights.sec_catalyst,    _score_sec_catalyst(c.sec_catalyst_type)),
-        "cross_source":   (weights.cross_source,    _score_cross_source(c.source_count)),
-        "wsb_mentions":   (weights.wsb_mentions,    _score_wsb_mentions(c.wsb_mentions)),
-        "st_rank":        (weights.stocktwits_rank, _score_stocktwits_rank(c.stocktwits_rank)),
-        "st_bullish":     (weights.st_bullish,      _score_st_bullish(c.stocktwits_bullish_pct)),
-        "reddit_quality": (weights.reddit_quality,  _score_reddit_quality(
-                              c.reddit_post_score, c.reddit_mentions)),
-        "news_sentiment": (weights.news_sentiment,  _score_news_sentiment(
-                              c.news_sentiment, c.news_catalyst_type)),
+        "sec_catalyst":     (weights.sec_catalyst,    _score_sec_catalyst(c.sec_catalyst_type)),
+        "cross_source":     (weights.cross_source,    _score_cross_source(c.source_count)),
+        "wsb_mentions":     (weights.wsb_mentions,    wsb_score),
+        "st_rank":          (weights.stocktwits_rank, _score_stocktwits_rank(c.stocktwits_rank)),
+        "st_bullish":       (weights.st_bullish,      _score_st_bullish(c.stocktwits_bullish_pct)),
+        "reddit_quality":   (weights.reddit_quality,  _score_reddit_quality(
+                                c.reddit_post_score, c.reddit_mentions)),
+        "reddit_sentiment": (weights.reddit_sentiment, _score_reddit_sentiment(c.reddit_sentiment)),
+        "news_sentiment":   (weights.news_sentiment,  _score_news_sentiment(
+                                c.news_sentiment, c.news_catalyst_type)),
     }
 
     total = sum(w * s for _, (w, s) in sub_scores.items())

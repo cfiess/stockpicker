@@ -8,7 +8,7 @@ Usage
   # Run immediately and print picks to screen
   python main.py
 
-  # Keep running on a schedule (fires at 9:45 ET on weekdays)
+  # Keep running on a schedule (fires at 8:30 ET on weekdays)
   python main.py --schedule
 
   # Show verbose scoring detail
@@ -143,8 +143,8 @@ def _is_weekday(dt: datetime) -> bool:
 
 
 def run_scheduler(
-    run_hour: int = 9,
-    run_minute: int = 45,
+    run_hour: int = 8,
+    run_minute: int = 30,
     num_picks: int = NUM_PICKS,
     verbose: bool = False,
 ) -> None:
@@ -189,12 +189,12 @@ def main() -> None:
         help="Show scoring detail for each pick",
     )
     parser.add_argument(
-        "--run-hour", type=int, default=9, metavar="HH",
-        help="Scheduler hour in ET (default: 9)",
+        "--run-hour", type=int, default=8, metavar="HH",
+        help="Scheduler hour in ET (default: 8)",
     )
     parser.add_argument(
-        "--run-minute", type=int, default=45, metavar="MM",
-        help="Scheduler minute in ET (default: 45)",
+        "--run-minute", type=int, default=30, metavar="MM",
+        help="Scheduler minute in ET (default: 30)",
     )
     args = parser.parse_args()
 

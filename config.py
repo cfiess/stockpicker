@@ -33,6 +33,12 @@ REQUEST_DELAY: float = 0.5
 # Hours back to scan SEC EDGAR 8-K filings
 SEC_LOOKBACK_HOURS: int = 24
 
+# Hours back to scan Reddit mentions.
+# Shorter = fresher signals, less stale post-catalyst noise.
+# 8h captures pre-market buzz and overnight catalysts without ingesting
+# yesterday's already-priced-in moves.
+REDDIT_LOOKBACK_HOURS: int = 8
+
 # ---------------------------------------------------------------------------
 # Catalyst type display labels
 # ---------------------------------------------------------------------------
@@ -74,6 +80,11 @@ class SignalWeights:
 
     # News headline sentiment score
     news_sentiment: float = 1.0
+
+    # Reddit keyword sentiment (0=bearish … 1=bullish).
+    # Also used as a dampening multiplier on wsb_mentions to suppress
+    # bearish pile-ons from inflating mention-count scores.
+    reddit_sentiment: float = 1.2
 
 
 # Default weights instance used by scorer.py
