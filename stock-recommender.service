@@ -1,0 +1,18 @@
+[Unit]
+Description=Stock Recommender — daily pick emailer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/stock_recommender
+EnvironmentFile=/home/user/stock_recommender/.env
+ExecStart=/usr/local/bin/python3 main.py --schedule
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
