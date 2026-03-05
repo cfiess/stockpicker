@@ -53,6 +53,13 @@ CATALYST_LABELS: Dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Email delivery
+# ---------------------------------------------------------------------------
+
+# Recipient for daily picks email
+EMAIL_TO: str = "cfiess@gmail.com"
+
+# ---------------------------------------------------------------------------
 # Scoring weights  ← tune these to change what matters most
 # ---------------------------------------------------------------------------
 # Each weight is a multiplier on a 0-1 normalised sub-score.

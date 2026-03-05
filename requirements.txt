@@ -12,8 +12,9 @@ python-dotenv>=1.0.0        # Load .env file
 # ── Timezone ─────────────────────────────────────────────────────────────────
 tzdata>=2024.1              # IANA timezone data (needed on some platforms)
 
-# ── Optional: SMS delivery (only needed if you want text message output) ─────
-# twilio>=9.0.0
+# ── Email delivery ───────────────────────────────────────────────────────────
+# Uses Python stdlib (smtplib + email.mime) — no extra packages needed.
+# Set GMAIL_USER and GMAIL_APP_PASSWORD in .env (see .env.example).
 
 # ── Optional: real-time price data (kept for future price enrichment) ─────────
 # yfinance>=0.2.38

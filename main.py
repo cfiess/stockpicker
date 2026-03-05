@@ -1,21 +1,31 @@
 """
 main.py — Entry point for the signal-based stock screener.
 
-Outputs picks directly to the terminal (no SMS required).
+Prints picks to the terminal and sends an email to cfiess@gmail.com.
 
 Usage
 -----
-  # Run immediately and print picks to screen
+  # Run immediately (prints + emails picks)
   python main.py
 
   # Keep running on a schedule (fires at 8:30 ET on weekdays)
   python main.py --schedule
+
+  # Preview email in terminal without actually sending
+  python main.py --dry-run
 
   # Show verbose scoring detail
   python main.py --verbose
 
   # Override number of picks
   python main.py --picks 3
+
+Email setup
+-----------
+  Add to .env:
+      GMAIL_USER=your.address@gmail.com
+      GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
+  (App Password from https://myaccount.google.com/apppasswords)
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import NUM_PICKS, SIGNAL_WEIGHTS
+from email_sender import send_email
 from scorer import rank_candidates
 from screener import CandidateStock, run_screen
 
@@ -113,25 +124,31 @@ def print_no_picks(reason: str) -> None:
 # Core job
 # ---------------------------------------------------------------------------
 
-def run_job(num_picks: int = NUM_PICKS, verbose: bool = False) -> None:
+def run_job(num_picks: int = NUM_PICKS, verbose: bool = False, dry_run: bool = False) -> None:
     log.info("=" * 60)
     log.info("Signal screener starting — %s", datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"))
     log.info("=" * 60)
 
+    generated_at = datetime.now(ET)
     candidates = run_screen()
 
     if not candidates:
-        print_no_picks("No tickers met the minimum signal thresholds across all sources.")
+        reason = "No tickers met the minimum signal thresholds across all sources."
+        print_no_picks(reason)
+        send_email([], generated_at=generated_at, dry_run=dry_run)
         return
 
     picks = rank_candidates(candidates, num_picks=num_picks, weights=SIGNAL_WEIGHTS)
 
     if not picks:
-        print_no_picks("Candidates found but scoring returned no picks.")
+        reason = "Candidates found but scoring returned no picks."
+        print_no_picks(reason)
+        send_email([], generated_at=generated_at, dry_run=dry_run)
         return
 
     print_picks(picks, verbose=verbose)
-    log.info("Done — %d pick(s) printed", len(picks))
+    send_email(picks, generated_at=generated_at, dry_run=dry_run)
+    log.info("Done — %d pick(s) printed and emailed", len(picks))
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +164,7 @@ def run_scheduler(
     run_minute: int = 30,
     num_picks: int = NUM_PICKS,
     verbose: bool = False,
+    dry_run: bool = False,
 ) -> None:
     log.info("Scheduler started — fires at %02d:%02d ET on weekdays", run_hour, run_minute)
     last_run_date = None
@@ -161,7 +179,7 @@ def run_scheduler(
         ):
             last_run_date = now.date()
             try:
-                run_job(num_picks=num_picks, verbose=verbose)
+                run_job(num_picks=num_picks, verbose=verbose, dry_run=dry_run)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Unhandled error in run_job: %s", exc)
 
@@ -189,6 +207,10 @@ def main() -> None:
         help="Show scoring detail for each pick",
     )
     parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print email preview to terminal instead of sending",
+    )
+    parser.add_argument(
         "--run-hour", type=int, default=8, metavar="HH",
         help="Scheduler hour in ET (default: 8)",
     )
@@ -205,11 +227,12 @@ def main() -> None:
                 run_minute=args.run_minute,
                 num_picks=args.picks,
                 verbose=args.verbose,
+                dry_run=args.dry_run,
             )
         except KeyboardInterrupt:
             log.info("Scheduler stopped")
     else:
-        run_job(num_picks=args.picks, verbose=args.verbose)
+        run_job(num_picks=args.picks, verbose=args.verbose, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
