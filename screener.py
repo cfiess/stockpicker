@@ -232,3 +232,94 @@ def run_screen() -> List[CandidateStock]:
     log.info("Screening complete: %d qualified candidates", len(candidates))
     candidates.sort(key=lambda c: (c.source_count, c.wsb_mentions), reverse=True)
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Way 2 screening: SEC EDGAR + Finviz gappers + Yahoo News
+# Works reliably in all environments (no Reddit or StockTwits required)
+# ---------------------------------------------------------------------------
+
+def run_screen_way2() -> List[CandidateStock]:
+    """
+    Way 2 pipeline: SEC EDGAR catalysts + Finviz gap-up confirmation + Yahoo News.
+
+    Uses only sources that work in every environment (local and GitHub Actions).
+    Returns CandidateStock objects ready for scoring with SIGNAL_WEIGHTS_WAY2.
+    """
+    from data_sources import get_gappers
+
+    log.info("[Way 2] Gathering SEC EDGAR 8-K filings…")
+    sec_signals = get_sec_catalysts(hours_back=24)
+
+    log.info("[Way 2] Gathering Finviz gappers…")
+    try:
+        gapper_tickers: set = set(get_gappers())
+        log.info("[Way 2] Finviz: %d gapping tickers", len(gapper_tickers))
+    except Exception as exc:
+        log.warning("[Way 2] Finviz gappers unavailable: %s", exc)
+        gapper_tickers = set()
+
+    # Build candidate pool — SEC tickers as base, Finviz as confirmation bonus
+    combined: dict = {}
+
+    for ticker, sd in sec_signals.items():
+        sources = list(sd.sources)
+        if ticker in gapper_tickers and "Finviz" not in sources:
+            sources.append("Finviz")
+        combined[ticker] = CandidateStock(
+            ticker=ticker,
+            company_name=sd.company_name,
+            sec_catalyst_type=sd.sec_catalyst_type,
+            sec_description=sd.sec_description,
+            sources=sources,
+        )
+
+    # Add pure gapper tickers not already in SEC
+    for ticker in gapper_tickers:
+        if ticker not in combined:
+            combined[ticker] = CandidateStock(
+                ticker=ticker,
+                sources=["Finviz"],
+            )
+
+    if not combined:
+        log.warning("[Way 2] No candidates found")
+        return []
+
+    # Sort: multi-source first, then SEC-confirmed, then Finviz-only
+    top_candidates = sorted(
+        combined.values(),
+        key=lambda c: (len(c.sources), bool(c.sec_catalyst_type)),
+        reverse=True,
+    )[:MAX_CANDIDATES]
+
+    candidates: List[CandidateStock] = []
+
+    for c in top_candidates:
+        time.sleep(REQUEST_DELAY)
+        company_name, headline, catalyst_type, sentiment = get_yahoo_news(c.ticker)
+        if company_name and not c.company_name:
+            c.company_name = company_name
+        c.news_headline = headline
+        c.news_catalyst_type = catalyst_type
+        c.news_sentiment = sentiment
+
+        if catalyst_type != "unknown" and "News" not in c.sources:
+            c.sources.append("News")
+
+        # Filter unverified tickers (no company name and no SEC catalyst)
+        if not c.company_name and not c.sec_catalyst_type:
+            log.debug("[Way 2] %s: skipped — unverified ticker", c.ticker)
+            continue
+
+        log.info(
+            "[Way 2] %s: sources=%s  catalyst=%s",
+            c.ticker,
+            c.sources_str,
+            c.best_catalyst_type,
+        )
+        candidates.append(c)
+
+    log.info("[Way 2] Screening complete: %d qualified candidates", len(candidates))
+    candidates.sort(key=lambda c: (c.source_count, bool(c.sec_catalyst_type)), reverse=True)
+    return candidates

@@ -97,6 +97,19 @@ class SignalWeights:
 # Default weights instance used by scorer.py
 SIGNAL_WEIGHTS: SignalWeights = SignalWeights()
 
+# Way 2 weights — SEC EDGAR + Finviz gappers + Yahoo News.
+# Reddit and StockTwits are zeroed out (blocked in GitHub Actions).
+SIGNAL_WEIGHTS_WAY2: SignalWeights = SignalWeights(
+    sec_catalyst=5.0,
+    news_sentiment=2.5,
+    cross_source=2.0,
+    wsb_mentions=0.0,
+    stocktwits_rank=0.0,
+    st_bullish=0.0,
+    reddit_quality=0.0,
+    reddit_sentiment=0.0,
+)
+
 # Catalyst quality ranking for sec_catalyst sub-score
 SEC_CATALYST_QUALITY: Dict[str, float] = {
     "earnings":   1.0,

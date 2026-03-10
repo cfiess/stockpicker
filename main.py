@@ -41,10 +41,10 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import NUM_PICKS, SIGNAL_WEIGHTS
+from config import NUM_PICKS, SIGNAL_WEIGHTS, SIGNAL_WEIGHTS_WAY2
 from email_sender import send_email
 from scorer import rank_candidates
-from screener import CandidateStock, run_screen
+from screener import CandidateStock, run_screen, run_screen_way2
 
 ET = ZoneInfo("America/New_York")
 
@@ -82,7 +82,7 @@ def format_pick(pick: CandidateStock, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
-def print_picks(picks: list, verbose: bool = False) -> None:
+def print_picks(picks1: list, picks2: list, verbose: bool = False) -> None:
     now = datetime.now(ET)
     date_str = now.strftime("%A %b %-d, %Y")
     time_str = now.strftime("%-I:%M %p ET")
@@ -92,18 +92,28 @@ def print_picks(picks: list, verbose: bool = False) -> None:
     print(f"  STOCK PICKS — {date_str}  |  {time_str}")
     print(_divider("═"))
 
-    if not picks:
-        print("\n  No qualifying picks today.\n")
-        print(_divider("═"))
-        return
-
-    for pick in picks:
-        print()
-        print(format_pick(pick, verbose=verbose))
-
-    print()
+    print(f"\n  WAY 1 — Social Sentiment  (Reddit · StockTwits · SEC EDGAR)")
     print(_divider("─"))
-    print("  Signals: Reddit (WSB/stocks/options) · StockTwits · SEC EDGAR · Yahoo News")
+    if picks1:
+        for pick in picks1:
+            print()
+            print(format_pick(pick, verbose=verbose))
+        print()
+    else:
+        print("\n  No picks — Reddit/StockTwits unavailable in this environment.\n")
+
+    print(_divider("═"))
+    print(f"\n  WAY 2 — Catalyst + Gappers  (SEC EDGAR · Finviz · Yahoo News)")
+    print(_divider("─"))
+    if picks2:
+        for pick in picks2:
+            print()
+            print(format_pick(pick, verbose=verbose))
+        print()
+    else:
+        print("\n  No picks today.\n")
+
+    print(_divider("─"))
     print("  Not financial advice. Do your own due diligence before trading.")
     print(_divider("═"))
     print()
@@ -130,25 +140,18 @@ def run_job(num_picks: int = NUM_PICKS, verbose: bool = False, dry_run: bool = F
     log.info("=" * 60)
 
     generated_at = datetime.now(ET)
-    candidates = run_screen()
 
-    if not candidates:
-        reason = "No tickers met the minimum signal thresholds across all sources."
-        print_no_picks(reason)
-        send_email([], generated_at=generated_at, dry_run=dry_run)
-        return
+    # Way 1: social sentiment + SEC (Reddit/StockTwits may be blocked in GitHub Actions)
+    candidates1 = run_screen()
+    picks1 = rank_candidates(candidates1, num_picks=num_picks, weights=SIGNAL_WEIGHTS) if candidates1 else []
 
-    picks = rank_candidates(candidates, num_picks=num_picks, weights=SIGNAL_WEIGHTS)
+    # Way 2: SEC + Finviz gappers + Yahoo News (works in all environments)
+    candidates2 = run_screen_way2()
+    picks2 = rank_candidates(candidates2, num_picks=num_picks, weights=SIGNAL_WEIGHTS_WAY2) if candidates2 else []
 
-    if not picks:
-        reason = "Candidates found but scoring returned no picks."
-        print_no_picks(reason)
-        send_email([], generated_at=generated_at, dry_run=dry_run)
-        return
-
-    print_picks(picks, verbose=verbose)
-    send_email(picks, generated_at=generated_at, dry_run=dry_run)
-    log.info("Done — %d pick(s) printed and emailed", len(picks))
+    print_picks(picks1, picks2, verbose=verbose)
+    send_email(picks1, picks2, generated_at=generated_at, dry_run=dry_run)
+    log.info("Done — Way 1: %d pick(s), Way 2: %d pick(s)", len(picks1), len(picks2))
 
 
 # ---------------------------------------------------------------------------
