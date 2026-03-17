@@ -53,7 +53,11 @@ def _format_pick_text(pick: CandidateStock) -> str:
     return "\n".join(lines)
 
 
-def build_plain_text(picks: List[CandidateStock], generated_at: Optional[datetime] = None) -> str:
+def build_plain_text(
+    picks1: List[CandidateStock],
+    picks2: List[CandidateStock],
+    generated_at: Optional[datetime] = None,
+) -> str:
     if generated_at is None:
         generated_at = datetime.now(ET)
     date_str = generated_at.strftime("%A %b %-d, %Y")
@@ -63,17 +67,33 @@ def build_plain_text(picks: List[CandidateStock], generated_at: Optional[datetim
         f"STOCK PICKS — {date_str}  |  Generated {time_str}",
         "=" * 62,
         "",
+        "WAY 1 — Social Sentiment  (Reddit · StockTwits · SEC EDGAR)",
+        "-" * 62,
     ]
-    if not picks:
-        lines.append("No qualifying picks today.")
-    else:
-        for pick in picks:
+    if picks1:
+        for pick in picks1:
             lines.append(_format_pick_text(pick))
             lines.append("")
+    else:
+        lines.append("No picks — Reddit/StockTwits unavailable in this environment.")
+        lines.append("")
+
+    lines += [
+        "=" * 62,
+        "",
+        "WAY 2 — Catalyst + Gappers  (SEC EDGAR · Finviz · Yahoo News)",
+        "-" * 62,
+    ]
+    if picks2:
+        for pick in picks2:
+            lines.append(_format_pick_text(pick))
+            lines.append("")
+    else:
+        lines.append("No picks today.")
+        lines.append("")
 
     lines += [
         "-" * 62,
-        "Signals: Reddit (WSB/stocks/options) · StockTwits · SEC EDGAR · Yahoo News",
         "Not financial advice. Do your own due diligence before trading.",
     ]
     return "\n".join(lines)
@@ -120,20 +140,46 @@ def _pick_html(pick: CandidateStock) -> str:
     </table>"""
 
 
-def build_html(picks: List[CandidateStock], generated_at: Optional[datetime] = None) -> str:
+def _section_header_html(title: str) -> str:
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:8px;">
+      <tr>
+        <td style="background:#2c3e50;padding:8px 18px;border-radius:6px;">
+          <span style="color:#ecf0f1;font-size:13px;font-weight:700;font-family:Arial,sans-serif;letter-spacing:0.5px;">
+            {title}
+          </span>
+        </td>
+      </tr>
+    </table>"""
+
+
+def _no_picks_html(message: str) -> str:
+    return (
+        f'<p style="font-family:Arial,sans-serif;color:#999;font-size:14px;'
+        f'padding:8px 18px;margin:0 0 20px 0;">{message}</p>'
+    )
+
+
+def build_html(
+    picks1: List[CandidateStock],
+    picks2: List[CandidateStock],
+    generated_at: Optional[datetime] = None,
+) -> str:
     if generated_at is None:
         generated_at = datetime.now(ET)
     date_str = generated_at.strftime("%A %b %-d, %Y")
     time_str = generated_at.strftime("%-I:%M %p ET")
 
-    if picks:
-        picks_html = "".join(_pick_html(p) for p in picks)
-    else:
-        picks_html = (
-            '<p style="font-family:Arial,sans-serif;color:#666;font-size:15px;">'
-            "No qualifying picks today &mdash; no tickers met the minimum signal thresholds."
-            "</p>"
-        )
+    way1_html = (
+        "".join(_pick_html(p) for p in picks1)
+        if picks1
+        else _no_picks_html("No picks &mdash; Reddit/StockTwits unavailable in this environment.")
+    )
+    way2_html = (
+        "".join(_pick_html(p) for p in picks2)
+        if picks2
+        else _no_picks_html("No picks today.")
+    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -159,7 +205,10 @@ def build_html(picks: List[CandidateStock], generated_at: Optional[datetime] = N
           <!-- Body -->
           <tr>
             <td style="background:#f4f6f8;padding:20px 0;">
-              {picks_html}
+              {_section_header_html("WAY 1 &mdash; Social Sentiment &nbsp;&middot;&nbsp; Reddit &middot; StockTwits &middot; SEC EDGAR")}
+              {way1_html}
+              {_section_header_html("WAY 2 &mdash; Catalyst + Gappers &nbsp;&middot;&nbsp; SEC EDGAR &middot; Finviz &middot; Yahoo News")}
+              {way2_html}
             </td>
           </tr>
 
@@ -167,7 +216,6 @@ def build_html(picks: List[CandidateStock], generated_at: Optional[datetime] = N
           <tr>
             <td style="background:#fff;border-radius:0 0 8px 8px;border:1px solid #e0e0e0;
                         padding:14px 18px;font-family:Arial,sans-serif;font-size:12px;color:#999;line-height:1.6;">
-              Signals: Reddit (r/wallstreetbets &middot; r/stocks &middot; r/options) &middot; StockTwits &middot; SEC EDGAR &middot; Yahoo Finance<br>
               <b>Not financial advice.</b> Do your own due diligence before trading.
             </td>
           </tr>
@@ -185,7 +233,8 @@ def build_html(picks: List[CandidateStock], generated_at: Optional[datetime] = N
 # ---------------------------------------------------------------------------
 
 def send_email(
-    picks: List[CandidateStock],
+    picks1: List[CandidateStock],
+    picks2: List[CandidateStock],
     generated_at: Optional[datetime] = None,
     dry_run: bool = False,
 ) -> bool:
@@ -205,8 +254,8 @@ def send_email(
     date_str = generated_at.strftime("%a %b %-d, %Y")
     subject = f"Stock Picks -- {date_str}"
 
-    plain = build_plain_text(picks, generated_at)
-    html = build_html(picks, generated_at)
+    plain = build_plain_text(picks1, picks2, generated_at)
+    html = build_html(picks1, picks2, generated_at)
 
     if dry_run:
         log.info("DRY RUN -- email not sent. Preview:\n%s", plain)
