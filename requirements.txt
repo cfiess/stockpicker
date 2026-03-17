@@ -16,6 +16,6 @@ tzdata>=2024.1              # IANA timezone data (needed on some platforms)
 # Uses Python stdlib (smtplib + email.mime) — no extra packages needed.
 # Set GMAIL_USER and GMAIL_APP_PASSWORD in .env (see .env.example).
 
-# ── Optional: real-time price data (kept for future price enrichment) ─────────
-# yfinance>=0.2.38
-# pandas>=2.0.0
+# ── Price data (used by data_sources.py / Way 2 gapper screener) ─────────────
+yfinance>=0.2.38
+pandas>=2.0.0
