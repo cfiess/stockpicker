@@ -2,7 +2,7 @@ name: Daily Stock Picks
 
 on:
   schedule:
-    - cron: '30 12 * * 1-5'   # 8:30 AM ET (UTC-4 EDT) — weekdays only
+    - cron: '30 12 * * 1-6'   # 8:30 AM ET (UTC-5 ET) — weekdays only
   workflow_dispatch:            # allows manual "Run workflow" button in GitHub UI
 
 jobs:
